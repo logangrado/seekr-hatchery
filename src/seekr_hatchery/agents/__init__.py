@@ -12,6 +12,7 @@ the appropriate singleton.
 """
 
 from .agent_backend import CONTAINER_HOME, AgentBackend
+from .claude import ClaudeBackend
 from .codex import CodexBackend
 
 __all__ = [
@@ -25,8 +26,10 @@ __all__ = [
 # ── Module-level singletons ────────────────────────────────────────────────────
 
 CODEX: AgentBackend = CodexBackend()
+CLAUDE: AgentBackend = ClaudeBackend()
 
 ALL_BACKENDS = [
+    CLAUDE,
     CODEX,
 ]
 
