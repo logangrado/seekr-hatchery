@@ -805,6 +805,16 @@ def cmd_sandbox(shell: str, rebuild_sandbox: bool) -> None:
     docker.launch_sandbox_shell(repo, backend, config, runtime, shell=shell, no_cache=rebuild_sandbox)
 
 
+@cli.command("exec")
+@click.argument("name")
+@click.option("--shell", default="/bin/bash", help="Shell to launch (default: /bin/bash)")
+def cmd_exec(name: str, shell: str) -> None:
+    """Exec an interactive shell into a running task's container."""
+    repo, _ = git.git_root_or_cwd()
+    runtime = docker.detect_runtime()
+    docker.exec_task_shell(name, runtime, repo, shell=shell)
+
+
 @cli.command("done")
 @click.argument("name")
 def cmd_done(name: str) -> None:
@@ -907,6 +917,21 @@ def cmd_status(name: str) -> None:
         click.echo(task_path.read_text())
     else:
         click.echo("\n(Task file not accessible — worktree may have been removed)")
+
+
+@cli.command("shell")
+@click.argument("name")
+def cmd_shell(name: str) -> None:
+    """Open a native shell in the task's worktree."""
+    repo, _ = git.git_root_or_cwd()
+    meta = tasks.load_task(repo, name)
+    worktree = Path(meta["worktree"])
+    if not worktree.exists():
+        ui.error(f"Worktree not found: {worktree}")
+        sys.exit(1)
+    shell = os.environ.get("SHELL", "bash")
+    ui.note(f"Opening shell in {worktree}  (exit with Ctrl-D or 'exit')")
+    subprocess.run([shell], cwd=worktree)
 
 
 # ---------------------------------------------------------------------------
