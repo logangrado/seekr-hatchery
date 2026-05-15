@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -14,11 +14,14 @@ import seekr_hatchery.tasks as tasks
 
 def _make_mutator(key: str = "test-key"):
     """Return a simple header mutator for tests."""
+
     def _mutate(headers):
         out = {k: v for k, v in headers.items() if k.lower() not in ("x-api-key", "authorization")}
         out["Authorization"] = f"Bearer {key}"
         return out
+
     return _mutate
+
 
 # ---------------------------------------------------------------------------
 # find_task_file
@@ -662,12 +665,8 @@ class TestDindCapMerge:
 
     def _run(self, **kwargs) -> list[str]:
         args = {**self._COMMON, **kwargs}
-        mock_server = MagicMock()
-        mock_server.server_address = ("0.0.0.0", 9999)
-        with patch("seekr_hatchery.docker.subprocess.run") as mock_run, \
-             patch("seekr_hatchery.proxy.start_proxy", return_value=(mock_server, "tok")), \
-             patch("seekr_hatchery.proxy.stop_proxy"):
-            docker._run_container(**args)
+        with patch("seekr_hatchery.docker.subprocess.run") as mock_run:
+            docker._run_container(**args, proxy_port=9999)
         return mock_run.call_args[0][0]
 
     def test_user_caps_merged(self):
@@ -742,12 +741,8 @@ class TestRunContainerDindFlags:
     def _run(self, **kwargs) -> list[str]:
         """Call _run_container with mock subprocess and return the captured cmd."""
         args = {**self._COMMON, **kwargs}
-        mock_server = MagicMock()
-        mock_server.server_address = ("0.0.0.0", 9999)
-        with patch("seekr_hatchery.docker.subprocess.run") as mock_run, \
-             patch("seekr_hatchery.proxy.start_proxy", return_value=(mock_server, "tok")), \
-             patch("seekr_hatchery.proxy.stop_proxy"):
-            docker._run_container(**args)
+        with patch("seekr_hatchery.docker.subprocess.run") as mock_run:
+            docker._run_container(**args, proxy_port=9999)
         return mock_run.call_args[0][0]
 
     def test_dind_false_no_extra_flags(self):
@@ -873,6 +868,108 @@ class TestTaskContainerName:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# sandbox_context — include_paths
+# ---------------------------------------------------------------------------
+
+
+class TestSandboxContextIncludePaths:
+    """Verify that include_paths appear in the sandbox context output."""
+
+    _BASE = dict(
+        name="my-task",
+        branch="hatchery/my-task",
+        worktree=Path("/repo/.hatchery/worktrees/my-task"),
+        repo=Path("/repo"),
+        main_branch="main",
+    )
+
+    def _ctx(self, use_docker: bool, no_worktree: bool, include_paths=None) -> str:
+        return tasks.sandbox_context(
+            **self._BASE,
+            use_docker=use_docker,
+            no_worktree=no_worktree,
+            include_paths=include_paths,
+        )
+
+    def _entry(self, path, mode="worktree"):
+        from seekr_hatchery.includes import IncludeEntry
+
+        return IncludeEntry(path=path, mode=mode)
+
+    def test_no_includes_produces_no_includes_section(self):
+        result = self._ctx(use_docker=True, no_worktree=False)
+        assert "Included paths" not in result
+
+    def test_empty_list_produces_no_includes_section(self):
+        result = self._ctx(use_docker=True, no_worktree=False, include_paths=[])
+        assert "Included paths" not in result
+
+    def test_docker_plain_dir_shows_container_path(self, tmp_path):
+        plain = tmp_path / "shared-data"
+        plain.mkdir()
+        result = self._ctx(use_docker=True, no_worktree=False, include_paths=[self._entry(plain)])
+        assert "Included paths" in result
+        assert "/includes/shared-data/" in result
+
+    def test_docker_git_repo_with_worktree_shows_worktree_path(self, tmp_path):
+        repo_b = tmp_path / "repo-b"
+        repo_b.mkdir()
+        (repo_b / ".git").mkdir()
+        import seekr_hatchery.tasks as tasks_mod
+
+        wt = repo_b / tasks_mod.WORKTREES_SUBDIR / "my-task"
+        wt.mkdir(parents=True)
+        result = self._ctx(use_docker=True, no_worktree=False, include_paths=[self._entry(repo_b)])
+        assert "/includes/repo-b/" in result
+        assert ".hatchery/worktrees/my-task" in result
+
+    def test_docker_basename_collision_shows_suffix(self, tmp_path):
+        a = tmp_path / "a" / "api"
+        b = tmp_path / "b" / "api"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+        result = self._ctx(use_docker=True, no_worktree=False, include_paths=[self._entry(a), self._entry(b)])
+        assert "/includes/api/" in result
+        assert "/includes/api-1/" in result
+
+    def test_native_plain_dir_shows_host_path(self, tmp_path):
+        plain = tmp_path / "shared-data"
+        plain.mkdir()
+        result = self._ctx(use_docker=False, no_worktree=False, include_paths=[self._entry(plain)])
+        assert "Included paths" in result
+        assert str(plain) in result
+
+    def test_native_git_repo_shows_worktree_host_path(self, tmp_path):
+        repo_b = tmp_path / "repo-b"
+        repo_b.mkdir()
+        (repo_b / ".git").mkdir()
+        import seekr_hatchery.tasks as tasks_mod
+
+        wt = repo_b / tasks_mod.WORKTREES_SUBDIR / "my-task"
+        wt.mkdir(parents=True)
+        result = self._ctx(use_docker=False, no_worktree=False, include_paths=[self._entry(repo_b)])
+        assert str(wt) in result
+
+    def test_docker_ro_reference_shows_read_only_label(self, tmp_path):
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        result = self._ctx(use_docker=True, no_worktree=False, include_paths=[self._entry(docs, mode="ro")])
+        assert "Included paths" in result
+        assert "/includes/docs/" in result
+        assert "read-only" in result
+
+    def test_docker_rw_reference_shows_read_write_label(self, tmp_path):
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        result = self._ctx(use_docker=True, no_worktree=False, include_paths=[self._entry(shared, mode="rw")])
+        assert "/includes/shared/" in result
+        assert "read-write" in result
+
+
+# ---------------------------------------------------------------------------
+
+
 class TestExecTaskShell:
     """Verify exec_task_shell execs directly into the named container."""
 
@@ -900,3 +997,64 @@ class TestExecTaskShell:
             docker.exec_task_shell("my-task", docker.Runtime.PODMAN, repo)
         cmd = mock_run.call_args[0][0]
         assert cmd[0] == "podman"
+
+
+# ---------------------------------------------------------------------------
+# IncludeEntry — serialisation / deserialisation
+# ---------------------------------------------------------------------------
+
+
+class TestIncludeEntry:
+    def test_serialize_worktree_entry(self):
+        from seekr_hatchery.includes import IncludeEntry, serialize_include_entries
+
+        entries = [IncludeEntry(path=Path("/a/b"), mode="worktree")]
+        assert serialize_include_entries(entries) == [{"path": "/a/b", "mode": "worktree"}]
+
+    def test_serialize_reference_entries(self):
+        from seekr_hatchery.includes import IncludeEntry, serialize_include_entries
+
+        entries = [
+            IncludeEntry(path=Path("/a/b"), mode="ro"),
+            IncludeEntry(path=Path("/c/d"), mode="rw"),
+        ]
+        result = serialize_include_entries(entries)
+        assert result == [{"path": "/a/b", "mode": "ro"}, {"path": "/c/d", "mode": "rw"}]
+
+    def test_load_new_format(self):
+        from seekr_hatchery.includes import IncludeEntry, load_include_entries
+
+        meta = {"include": [{"path": "/a/b", "mode": "ro"}, {"path": "/c/d", "mode": "worktree"}]}
+        entries = load_include_entries(meta)
+        assert entries == [IncludeEntry(Path("/a/b"), "ro"), IncludeEntry(Path("/c/d"), "worktree")]
+
+    def test_load_old_format_string_list(self):
+        """Old meta.json format (plain strings) is silently upgraded to worktree mode."""
+        from seekr_hatchery.includes import IncludeEntry, load_include_entries
+
+        meta = {"include": ["/a/b", "/c/d"]}
+        entries = load_include_entries(meta)
+        assert entries == [IncludeEntry(Path("/a/b"), "worktree"), IncludeEntry(Path("/c/d"), "worktree")]
+
+    def test_load_missing_key_returns_empty(self):
+        from seekr_hatchery.tasks import load_include_entries
+
+        assert load_include_entries({}) == []
+
+    def test_is_reference_true_for_ro_rw(self):
+        from seekr_hatchery.includes import IncludeEntry
+
+        assert IncludeEntry(Path("/x"), mode="ro").is_reference() is True
+        assert IncludeEntry(Path("/x"), mode="rw").is_reference() is True
+
+    def test_is_reference_false_for_worktree(self):
+        from seekr_hatchery.includes import IncludeEntry
+
+        assert IncludeEntry(Path("/x"), mode="worktree").is_reference() is False
+
+    def test_load_unknown_mode_defaults_to_worktree(self):
+        from seekr_hatchery.includes import IncludeEntry, load_include_entries
+
+        meta = {"include": [{"path": "/a/b", "mode": "bogus"}]}
+        entries = load_include_entries(meta)
+        assert entries == [IncludeEntry(Path("/a/b"), "worktree")]

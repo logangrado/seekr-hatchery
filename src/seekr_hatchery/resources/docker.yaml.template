@@ -18,12 +18,71 @@ mounts:
   # DANGEROUS: Uncomment for ssh access
   # - "~/.ssh:/home/hatchery/.ssh:ro"
 
+# include: additional repos or directories to mount inside the container.
+# Paths are mounted at /includes/<basename>/. Paths are relative to this
+# repo's root, or absolute. Merged with --include* flags passed to `hatchery new`.
+#
+# Three mount modes are supported (default: worktree):
+#   worktree  — git repos get a hatchery/<task> branch + worktree for isolation (read-write)
+#   rw        — reference mount, read-write, no worktree created
+#   ro        — reference mount, read-only, no worktree created
+#
+# String entries use "worktree" mode (unchanged from previous behaviour).
+# To change mode, use the dict form. You can switch modes while a task is paused
+# by editing this file and running `hatchery resume <name>`.
+#
+# include:
+#   - ../other-repo                 # worktree mode (default)
+#   - path: ../shared-types         # read-write reference mount, no worktree
+#     mode: rw
+#   - path: /docs                   # read-only reference mount
+#     mode: ro
+
 # Set to true to enable Podman-in-Podman (nested container support).
 # Also uncomment the DinD section in .hatchery/Dockerfile.
 dind: false
+
+# When true, hatchery scans the worktree (or cwd in --no-worktree mode) on
+# launch, finds symlinks whose targets sit outside the mounted area, and
+# bind-mounts each target at the same absolute host path (read-write) so the
+# symlink resolves inside the container. Targets already covered by an
+# existing mount or living under system paths (/usr, /bin, /lib, /etc, ...)
+# are skipped. Walks skip .git, node_modules, .venv, and similar heavyweight
+# directories to keep startup fast on large repos.
+#
+# Each symlink must be one of:
+#   - relative,  target inside  the mounted directory  (works as-is)
+#   - absolute,  target outside the mounted directory  (target gets bind-mounted)
+# The other two shapes (absolute-internal, relative-external) don't survive
+# the host→container path remap and will cause launch to fail with an error
+# naming the offending link.
+follow_symlinks: false
 
 # cap_add: extra Linux capabilities to grant inside the DinD container.
 # Only takes effect when dind: true. Values are validated against
 # capabilities(7); invalid names are rejected at load time.
 # cap_add:
 #   - NET_BIND_SERVICE
+
+# kubernetes: give the agent a kubectl command with virtual RBAC filtering.
+#
+# Also uncomment the kubectl section in .hatchery/Dockerfile.
+# The host's active kubeconfig context is used for credentials.
+#
+# context: (optional) pin which kubeconfig context kubectl proxy uses.
+#   Useful when you have multiple contexts and want to avoid ambiguity.
+#   Defaults to the host's currently active context.
+# Rules are an allowlist; unmatched requests are denied (fail-closed).
+# Verbs map to HTTP methods: get/list/watch → GET, create → POST,
+#   update → PUT, patch → PATCH, delete/deletecollection → DELETE.
+#   Note: 'describe' is a kubectl client command, not a k8s verb — use 'get'.
+# namespaces: "*"  matches all namespaces.
+#             ""   matches cluster-scoped queries (e.g. `kubectl get pods -A`).
+# Subresources exec / attach / portforward / proxy are always blocked.
+#
+# kubernetes:
+#   context: my-dev-cluster   # optional: pin kubeconfig context
+#   rules:
+#     - verbs: [get, list, watch]
+#       resources: ["*"]
+#       namespaces: ["*"]

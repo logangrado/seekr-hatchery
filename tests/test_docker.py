@@ -8,7 +8,6 @@ import pytest
 
 import seekr_hatchery.agents as agent
 import seekr_hatchery.docker as docker
-import seekr_hatchery.proxy as proxy_mod
 import seekr_hatchery.tasks as tasks
 
 # ---------------------------------------------------------------------------
@@ -235,10 +234,12 @@ class TestResolveRuntime:
 
 def _make_mutator(key: str = "real-secret-key"):
     """Return a simple header mutator for tests."""
+
     def _mutate(headers):
         out = {k: v for k, v in headers.items() if k.lower() not in ("x-api-key", "authorization")}
         out["Authorization"] = f"Bearer {key}"
         return out
+
     return _mutate
 
 
@@ -257,12 +258,6 @@ class TestRunContainerRuntime:
             mutator = _make_mutator()
         captured: list[list[str]] = []
 
-        # Mock the proxy so we don't start a real server; inject predictable values.
-        mock_server = MagicMock()
-        mock_server.server_address = ("0.0.0.0", proxy_port)
-        monkeypatch.setattr(proxy_mod, "start_proxy", lambda _mutator, _token, **kw: (mock_server, "ignored-token"))
-        monkeypatch.setattr(proxy_mod, "stop_proxy", lambda _srv: None)
-
         def _mock_run(cmd, **kw):
             captured.append(cmd)
             return docker.subprocess.CompletedProcess(cmd, 0)
@@ -279,6 +274,7 @@ class TestRunContainerRuntime:
             agent_cmd=["codex"],
             backend=agent.CODEX,
             runtime=runtime,
+            proxy_port=proxy_port,
         )
         return captured[0]
 
@@ -371,12 +367,6 @@ class TestRunContainerRuntime:
 
     def test_no_api_key_env_when_mutator_is_none(self, monkeypatch):
         """When mutator is None, no API key or base URL env vars should appear."""
-        monkeypatch.setattr(
-            proxy_mod,
-            "start_proxy",
-            lambda _mutator, _token, **kw: (_ for _ in ()).throw(AssertionError("should not be called")),
-        )
-
         captured: list[list[str]] = []
 
         def _mock_run(cmd, **kw):
@@ -606,3 +596,594 @@ class TestStreamBuild:
         monkeypatch.setattr(docker.subprocess, "run", _mock_run)
         docker._stream_build(["echo", "hello"], cwd=_sys.modules["pathlib"].Path("."))
         assert captured_kwargs[0].get("stdin") is subprocess.DEVNULL
+
+
+# ---------------------------------------------------------------------------
+# _docker_mounts_includes()
+# ---------------------------------------------------------------------------
+
+
+class TestDockerMountsIncludes:
+    def _entry(self, path, mode="worktree"):
+        from seekr_hatchery.includes import IncludeEntry
+
+        return IncludeEntry(path=path, mode=mode)
+
+    def test_plain_dir_gets_rw_mount(self, tmp_path):
+        """A plain (non-git) directory in worktree mode is mounted rw."""
+        plain = tmp_path / "shared-data"
+        plain.mkdir()
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+
+        mounts = docker._docker_mounts_includes([self._entry(plain)], "my-task", session_dir, no_worktree=False)
+
+        assert f"{plain}:/includes/shared-data:rw" in mounts
+
+    def test_git_repo_without_worktree_gets_rw_mount(self, tmp_path):
+        """A git repo in worktree mode with no worktree for the task falls back to rw mount."""
+        repo = tmp_path / "repo-b"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+
+        mounts = docker._docker_mounts_includes([self._entry(repo)], "my-task", session_dir, no_worktree=False)
+
+        assert f"{repo}:/includes/repo-b:rw" in mounts
+        assert not any("git_ptr" in m for m in mounts)
+
+    def test_git_repo_with_worktree_gets_layered_mounts(self, tmp_path):
+        """A git repo in worktree mode with a task worktree gets layered mounts."""
+        import seekr_hatchery.tasks as tasks_mod
+
+        repo = tmp_path / "repo-b"
+        repo.mkdir()
+        git_dir = repo / ".git"
+        git_dir.mkdir()
+        (git_dir / "objects").mkdir()
+        worktree = repo / tasks_mod.WORKTREES_SUBDIR / "my-task"
+        worktree.mkdir(parents=True)
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+
+        mounts = docker._docker_mounts_includes([self._entry(repo)], "my-task", session_dir, no_worktree=False)
+
+        assert f"{repo}:/includes/repo-b:ro" in mounts
+        assert f"{git_dir}:/includes/repo-b/.git:rw" in mounts
+        assert f"{git_dir / 'objects'}:/includes/repo-b/.git/objects:rw" in mounts
+        container_wt = "/includes/repo-b/.hatchery/worktrees/my-task"
+        assert f"{worktree}:{container_wt}:rw" in mounts
+        git_ptr_file = session_dir / "git_ptr_include_repo-b"
+        assert git_ptr_file.exists()
+        assert "gitdir: /includes/repo-b/.git/worktrees/my-task" in git_ptr_file.read_text()
+        assert f"{git_ptr_file}:{container_wt}/.git:rw" in mounts
+        assert f"{repo}:/includes/repo-b:rw" not in mounts
+
+    def test_basename_collision_gets_numeric_suffix(self, tmp_path):
+        """Two paths sharing the same basename get distinct container paths."""
+        a = tmp_path / "a" / "api"
+        b = tmp_path / "b" / "api"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+
+        mounts = docker._docker_mounts_includes(
+            [self._entry(a), self._entry(b)], "task", session_dir, no_worktree=False
+        )
+
+        assert f"{a}:/includes/api:rw" in mounts
+        assert f"{b}:/includes/api-1:rw" in mounts
+
+    def test_no_worktree_skips_layered_mounts(self, tmp_path):
+        """In no-worktree mode, worktree-mode git repos get a simple rw mount."""
+        repo = tmp_path / "repo-b"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        import seekr_hatchery.tasks as tasks_mod
+
+        worktree = repo / tasks_mod.WORKTREES_SUBDIR / "my-task"
+        worktree.mkdir(parents=True)
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+
+        mounts = docker._docker_mounts_includes([self._entry(repo)], "my-task", session_dir, no_worktree=True)
+
+        assert f"{repo}:/includes/repo-b:rw" in mounts
+        git_ptr_file = session_dir / "git_ptr_include_repo-b"
+        assert not git_ptr_file.exists()
+        assert not any(str(git_ptr_file) in m for m in mounts)
+
+    def test_empty_list_returns_empty(self, tmp_path):
+        mounts = docker._docker_mounts_includes([], "task", tmp_path, no_worktree=False)
+        assert mounts == []
+
+    # ── reference mode tests ─────────────────────────────────────────────────
+
+    def test_reference_rw_plain_dir(self, tmp_path):
+        """mode='rw' gives a simple rw mount, no worktree logic."""
+        plain = tmp_path / "shared-data"
+        plain.mkdir()
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+
+        mounts = docker._docker_mounts_includes(
+            [self._entry(plain, mode="rw")], "my-task", session_dir, no_worktree=False
+        )
+
+        assert f"{plain}:/includes/shared-data:rw" in mounts
+
+    def test_reference_ro_plain_dir(self, tmp_path):
+        """mode='ro' gives a simple ro mount."""
+        plain = tmp_path / "docs"
+        plain.mkdir()
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+
+        mounts = docker._docker_mounts_includes(
+            [self._entry(plain, mode="ro")], "my-task", session_dir, no_worktree=False
+        )
+
+        assert f"{plain}:/includes/docs:ro" in mounts
+        assert f"{plain}:/includes/docs:rw" not in mounts
+
+    def test_reference_mode_git_repo_no_layered_mounts(self, tmp_path):
+        """mode='ro' on a git repo with a worktree still just does a simple ro mount."""
+        import seekr_hatchery.tasks as tasks_mod
+
+        repo = tmp_path / "repo-b"
+        repo.mkdir()
+        git_dir = repo / ".git"
+        git_dir.mkdir()
+        (git_dir / "objects").mkdir()
+        # Create a worktree — it should be ignored in reference mode
+        worktree = repo / tasks_mod.WORKTREES_SUBDIR / "my-task"
+        worktree.mkdir(parents=True)
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+
+        mounts = docker._docker_mounts_includes(
+            [self._entry(repo, mode="ro")], "my-task", session_dir, no_worktree=False
+        )
+
+        assert f"{repo}:/includes/repo-b:ro" in mounts
+        # No layered mounts
+        assert f"{repo}:/includes/repo-b:rw" not in mounts
+        assert not any("git_ptr" in m for m in mounts)
+        assert not any("worktrees" in m for m in mounts)
+
+    def test_reference_rw_git_repo_no_layered_mounts(self, tmp_path):
+        """mode='rw' on a git repo with a worktree still just does a simple rw reference mount."""
+        import seekr_hatchery.tasks as tasks_mod
+
+        repo = tmp_path / "repo-c"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        worktree = repo / tasks_mod.WORKTREES_SUBDIR / "my-task"
+        worktree.mkdir(parents=True)
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+
+        mounts = docker._docker_mounts_includes(
+            [self._entry(repo, mode="rw")], "my-task", session_dir, no_worktree=False
+        )
+
+        assert f"{repo}:/includes/repo-c:rw" in mounts
+        assert not any("git_ptr" in m for m in mounts)
+        assert not any("worktrees" in m for m in mounts)
+
+    def test_mixed_modes(self, tmp_path):
+        """Mixed worktree and reference entries produce correct mounts each."""
+
+        wt_repo = tmp_path / "wt-repo"
+        wt_repo.mkdir()
+        (wt_repo / ".git").mkdir()
+        ro_dir = tmp_path / "docs"
+        ro_dir.mkdir()
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+
+        from seekr_hatchery.includes import IncludeEntry
+
+        entries = [
+            IncludeEntry(path=wt_repo, mode="worktree"),
+            IncludeEntry(path=ro_dir, mode="ro"),
+        ]
+        mounts = docker._docker_mounts_includes(entries, "my-task", session_dir, no_worktree=False)
+
+        # worktree entry without an actual worktree → rw fallback
+        assert f"{wt_repo}:/includes/wt-repo:rw" in mounts
+        # ro reference entry
+        assert f"{ro_dir}:/includes/docs:ro" in mounts
+
+
+# ---------------------------------------------------------------------------
+# DockerConfig.include field
+# ---------------------------------------------------------------------------
+
+
+class TestDockerConfigInclude:
+    def test_defaults_to_empty(self):
+        config = docker.DockerConfig()
+        assert config.include == []
+
+    def test_parses_string_include_list(self):
+        config = docker.DockerConfig(include=["../repo-b", "/abs/path"])
+        assert config.include == ["../repo-b", "/abs/path"]
+
+    def test_parses_dict_include_entry(self):
+        from seekr_hatchery.includes import IncludeItem
+
+        config = docker.DockerConfig(include=[{"path": "../ref", "mode": "ro"}])
+        assert config.include == [IncludeItem(path="../ref", mode="ro")]
+
+    def test_parses_mixed_include_list(self):
+        from seekr_hatchery.includes import IncludeItem
+
+        config = docker.DockerConfig(include=["../wt-repo", {"path": "../ref", "mode": "rw"}])
+        assert config.include[0] == "../wt-repo"
+        assert config.include[1] == IncludeItem(path="../ref", mode="rw")
+
+    def test_dict_without_path_is_invalid(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            docker.DockerConfig(include=[{"mode": "ro"}])
+
+    def test_dict_invalid_mode_is_rejected(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            docker.DockerConfig(include=[{"path": "../foo", "mode": "readwrite"}])
+
+    def test_dict_extra_keys_are_rejected(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            docker.DockerConfig(include=[{"path": "../foo", "mode": "ro", "extra": "oops"}])
+
+    def test_extra_fields_still_forbidden(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            docker.DockerConfig(unknown_field="oops")
+
+
+# ensure_docker_files_uncommitted
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureDockerFilesUncommitted:
+    def test_copies_from_repo_root_when_worktree_missing(self, tmp_path, monkeypatch):
+        """When files exist in repo root but not in worktree, they are copied."""
+        repo = tmp_path / "repo"
+        worktree = tmp_path / "worktree"
+        for d in (repo / ".hatchery", worktree / ".hatchery"):
+            d.mkdir(parents=True)
+
+        # Place files only in repo root
+        (repo / ".hatchery" / "Dockerfile.codex").write_text("FROM debian\n")
+        (repo / tasks.DOCKER_CONFIG).write_text("schema_version: '1'\n")
+
+        # suppress interactive prompts (shouldn't be hit, but be safe)
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+
+        docker.ensure_docker_files_uncommitted(repo, worktree, agent.CODEX)
+
+        assert (worktree / ".hatchery" / "Dockerfile.codex").exists()
+        assert (worktree / tasks.DOCKER_CONFIG).exists()
+
+    def test_generates_when_repo_root_also_missing(self, tmp_path, monkeypatch):
+        """When neither repo root nor worktree has files, generates from template."""
+        repo = tmp_path / "repo"
+        worktree = tmp_path / "worktree"
+        for d in (repo / ".hatchery", worktree / ".hatchery"):
+            d.mkdir(parents=True)
+
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+
+        docker.ensure_docker_files_uncommitted(repo, worktree, agent.CODEX)
+
+        assert (repo / ".hatchery" / "Dockerfile.codex").exists()
+        assert (worktree / ".hatchery" / "Dockerfile.codex").exists()
+        assert (repo / tasks.DOCKER_CONFIG).exists()
+        assert (worktree / tasks.DOCKER_CONFIG).exists()
+
+    def test_worktree_files_unchanged_when_already_present(self, tmp_path, monkeypatch):
+        """When worktree already has files, they are not overwritten."""
+        repo = tmp_path / "repo"
+        worktree = tmp_path / "worktree"
+        for d in (repo / ".hatchery", worktree / ".hatchery"):
+            d.mkdir(parents=True)
+
+        original_df = "FROM custom-image\n"
+        original_cfg = "schema_version: '1'\nmounts: []\n"
+        (worktree / ".hatchery" / "Dockerfile.codex").write_text(original_df)
+        (worktree / tasks.DOCKER_CONFIG).write_text(original_cfg)
+
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+
+        docker.ensure_docker_files_uncommitted(repo, worktree, agent.CODEX)
+
+        # Worktree files should be untouched
+        assert (worktree / ".hatchery" / "Dockerfile.codex").read_text() == original_df
+        assert (worktree / tasks.DOCKER_CONFIG).read_text() == original_cfg
+
+
+# ---------------------------------------------------------------------------
+# parse_docker_include_entry()
+# ---------------------------------------------------------------------------
+
+
+class TestParseDockerIncludeEntry:
+    def test_string_gives_worktree_mode(self):
+        assert docker.parse_docker_include_entry("../repo") == ("../repo", "worktree")
+
+    def test_item_with_mode_ro(self):
+        from seekr_hatchery.includes import IncludeItem
+
+        assert docker.parse_docker_include_entry(IncludeItem(path="../docs", mode="ro")) == ("../docs", "ro")
+
+    def test_item_with_mode_rw(self):
+        from seekr_hatchery.includes import IncludeItem
+
+        assert docker.parse_docker_include_entry(IncludeItem(path="../shared", mode="rw")) == ("../shared", "rw")
+
+    def test_item_with_mode_worktree(self):
+        from seekr_hatchery.includes import IncludeItem
+
+        assert docker.parse_docker_include_entry(IncludeItem(path="../repo", mode="worktree")) == (
+            "../repo",
+            "worktree",
+        )
+
+    def test_item_without_mode_defaults_to_worktree(self):
+        from seekr_hatchery.includes import IncludeItem
+
+        assert docker.parse_docker_include_entry(IncludeItem(path="../repo")) == ("../repo", "worktree")
+
+
+# ---------------------------------------------------------------------------
+# DockerConfig.follow_symlinks field
+# ---------------------------------------------------------------------------
+
+
+class TestDockerConfigFollowSymlinks:
+    def test_defaults_to_false(self):
+        assert docker.DockerConfig().follow_symlinks is False
+
+    def test_parses_true(self):
+        assert docker.DockerConfig(follow_symlinks=True).follow_symlinks is True
+
+
+# ---------------------------------------------------------------------------
+# _construct_symlink_mounts()
+# ---------------------------------------------------------------------------
+
+
+class TestConstructSymlinkMounts:
+    def _scan_root(self, tmp_path):
+        """Build an isolated worktree-like directory under tmp_path."""
+        root = tmp_path / "worktree"
+        root.mkdir()
+        return root
+
+    def test_external_file_symlink_emits_mount(self, tmp_path):
+        scan = self._scan_root(tmp_path)
+        external = tmp_path / "external" / "file.txt"
+        external.parent.mkdir()
+        external.write_text("hello")
+        (scan / "link").symlink_to(external)
+
+        mounts = docker._construct_symlink_mounts(scan, [])
+
+        target = external.resolve()
+        assert mounts == [f"{target}:{target}:rw"]
+
+    def test_external_dir_symlink_emits_mount(self, tmp_path):
+        scan = self._scan_root(tmp_path)
+        external = tmp_path / "external" / "dir"
+        external.mkdir(parents=True)
+        (external / "child").write_text("x")
+        (scan / "linkdir").symlink_to(external)
+
+        mounts = docker._construct_symlink_mounts(scan, [])
+
+        target = external.resolve()
+        assert f"{target}:{target}:rw" in mounts
+
+    def test_relative_internal_symlink_skipped(self, tmp_path):
+        """Relative links staying inside scan_root resolve correctly in the
+        container and need no extra mount."""
+        scan = self._scan_root(tmp_path)
+        (scan / "inner.txt").write_text("x")
+        (scan / "link").symlink_to("inner.txt")
+
+        mounts = docker._construct_symlink_mounts(scan, [])
+
+        assert mounts == []
+
+    def test_dedupes_same_target(self, tmp_path):
+        scan = self._scan_root(tmp_path)
+        external = tmp_path / "external" / "file.txt"
+        external.parent.mkdir()
+        external.write_text("hello")
+        (scan / "a").symlink_to(external)
+        (scan / "b").symlink_to(external)
+
+        mounts = docker._construct_symlink_mounts(scan, [])
+
+        assert len(mounts) == 1
+
+    def test_already_covered_by_existing_mount(self, tmp_path):
+        scan = self._scan_root(tmp_path)
+        external_root = tmp_path / "external"
+        external_root.mkdir()
+        external_file = external_root / "file.txt"
+        external_file.write_text("x")
+        (scan / "link").symlink_to(external_file)
+
+        # external_root is already a mount; its child should be skipped
+        existing = [f"{external_root}:/mounted/external:ro"]
+        mounts = docker._construct_symlink_mounts(scan, existing)
+
+        assert mounts == []
+
+    def test_broken_symlink_skipped(self, tmp_path):
+        scan = self._scan_root(tmp_path)
+        (scan / "broken").symlink_to(tmp_path / "does-not-exist")
+
+        mounts = docker._construct_symlink_mounts(scan, [])
+
+        assert mounts == []
+
+    def test_system_path_target_skipped(self, tmp_path):
+        scan = self._scan_root(tmp_path)
+        # Use /usr/bin/env which exists on all Linux/macOS test runners
+        (scan / "syslink").symlink_to("/usr/bin/env")
+
+        mounts = docker._construct_symlink_mounts(scan, [])
+
+        assert mounts == []
+
+    def test_heavyweight_dir_pruned(self, tmp_path):
+        scan = self._scan_root(tmp_path)
+        external = tmp_path / "external" / "file.txt"
+        external.parent.mkdir()
+        external.write_text("x")
+        node_modules = scan / "node_modules"
+        node_modules.mkdir()
+        (node_modules / "link").symlink_to(external)
+
+        mounts = docker._construct_symlink_mounts(scan, [])
+
+        # The symlink inside node_modules is never visited.
+        assert mounts == []
+
+    def test_nested_relative_internal_symlink_skipped(self, tmp_path):
+        """Relative links climbing within scan_root (but not escaping) are fine."""
+        scan = self._scan_root(tmp_path)
+        (scan / "a").mkdir()
+        (scan / "b").mkdir()
+        (scan / "b" / "file.txt").write_text("x")
+        (scan / "a" / "link").symlink_to("../b/file.txt")
+
+        mounts = docker._construct_symlink_mounts(scan, [])
+
+        assert mounts == []
+
+    def test_nested_external_target(self, tmp_path):
+        """Symlinks discovered in nested (non-skipped) subdirs still emit mounts."""
+        scan = self._scan_root(tmp_path)
+        nested = scan / "a" / "b"
+        nested.mkdir(parents=True)
+        external = tmp_path / "external" / "data"
+        external.mkdir(parents=True)
+        (nested / "link").symlink_to(external)
+
+        mounts = docker._construct_symlink_mounts(scan, [])
+
+        target = external.resolve()
+        assert mounts == [f"{target}:{target}:rw"]
+
+    def test_absolute_internal_link_raises(self, tmp_path, capsys):
+        """Absolute link pointing inside scan_root fails loudly — the host path
+        doesn't exist inside the container after the worktree remap."""
+        scan = self._scan_root(tmp_path)
+        (scan / "inner.txt").write_text("x")
+        (scan / "link").symlink_to(scan / "inner.txt")  # absolute target
+
+        with pytest.raises(SystemExit):
+            docker._construct_symlink_mounts(scan, [])
+
+        err = capsys.readouterr().err
+        assert "follow_symlinks" in err
+        assert "Absolute links pointing inside" in err
+        assert str(scan / "link") in err
+
+    def test_relative_external_link_raises(self, tmp_path, capsys):
+        """Relative link escaping scan_root fails loudly — the relative climb
+        anchors at the remapped container path and lands elsewhere."""
+        scan = self._scan_root(tmp_path)
+        external = tmp_path / "external"
+        external.mkdir()
+        (scan / "link").symlink_to("../external")
+
+        with pytest.raises(SystemExit):
+            docker._construct_symlink_mounts(scan, [])
+
+        err = capsys.readouterr().err
+        assert "Relative links escaping" in err
+        assert str(scan / "link") in err
+        assert "../external" in err
+
+    def test_error_reports_both_kinds_at_once(self, tmp_path, capsys):
+        """Multiple problematic links are reported together, not one at a time."""
+        scan = self._scan_root(tmp_path)
+        (scan / "inner.txt").write_text("x")
+        (tmp_path / "external").mkdir()
+        (scan / "abs_bad").symlink_to(scan / "inner.txt")
+        (scan / "rel_bad").symlink_to("../external")
+
+        with pytest.raises(SystemExit):
+            docker._construct_symlink_mounts(scan, [])
+
+        err = capsys.readouterr().err
+        assert "Absolute links pointing inside" in err
+        assert "Relative links escaping" in err
+        assert str(scan / "abs_bad") in err
+        assert str(scan / "rel_bad") in err
+
+    def test_error_mentions_disabling_the_flag(self, tmp_path, capsys):
+        """Error message points the user at the escape hatch."""
+        scan = self._scan_root(tmp_path)
+        (scan / "inner.txt").write_text("x")
+        (scan / "link").symlink_to(scan / "inner.txt")
+
+        with pytest.raises(SystemExit):
+            docker._construct_symlink_mounts(scan, [])
+
+        err = capsys.readouterr().err
+        assert "follow_symlinks: false" in err
+
+
+# ---------------------------------------------------------------------------
+# docker_mounts_no_worktree honors follow_symlinks
+# ---------------------------------------------------------------------------
+
+
+class TestNoWorktreeFollowSymlinks:
+    def _make_backend(self):
+        b = MagicMock()
+        b.home_mounts = MagicMock(return_value=[])
+        return b
+
+    def test_disabled_skips_symlink_scan(self, tmp_path, monkeypatch):
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        external = tmp_path / "external"
+        external.mkdir()
+        (cwd / "link").symlink_to(external)
+        # Avoid coupling to the user's real home mounts (e.g. uv cache).
+        monkeypatch.setattr(docker, "_default_home_mounts", lambda: [])
+
+        cfg = docker.DockerConfig(follow_symlinks=False)
+        mounts = docker.docker_mounts_no_worktree(cwd, self._make_backend(), tmp_path, cfg)
+
+        target = external.resolve()
+        assert not any(f"{target}:{target}:rw" == m for m in mounts)
+
+    def test_enabled_adds_symlink_mounts(self, tmp_path, monkeypatch):
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        external = tmp_path / "external"
+        external.mkdir()
+        (cwd / "link").symlink_to(external)
+        monkeypatch.setattr(docker, "_default_home_mounts", lambda: [])
+
+        cfg = docker.DockerConfig(follow_symlinks=True)
+        mounts = docker.docker_mounts_no_worktree(cwd, self._make_backend(), tmp_path, cfg)
+
+        target = external.resolve()
+        assert f"{target}:{target}:rw" in mounts

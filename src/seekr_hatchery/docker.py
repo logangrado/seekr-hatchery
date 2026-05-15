@@ -1,6 +1,7 @@
 """Docker sandbox helpers."""
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -8,7 +9,8 @@ import sys
 import tempfile
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -16,11 +18,15 @@ from typing import Literal
 import click
 import yaml
 from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import ValidationError as _PydanticValidationError
 
 import seekr_hatchery.agents as agent
+import seekr_hatchery.kubectl_proxy as _kubectl_proxy
 import seekr_hatchery.proxy as proxy
 import seekr_hatchery.tasks as tasks
 import seekr_hatchery.ui as ui
+from seekr_hatchery.includes import IncludeEntry, IncludeItem
+from seekr_hatchery.kubectl_proxy import KubectlConfig
 
 logger = logging.getLogger("hatchery")
 
@@ -124,8 +130,11 @@ class DockerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: Literal["1"] = "1"
     mounts: list[str] = []
+    include: list[str | IncludeItem] = []
     dind: bool = False
+    follow_symlinks: bool = False
     cap_add: list[str] = []
+    kubernetes: KubectlConfig | None = None
 
     @field_validator("cap_add", mode="before")
     @classmethod
@@ -159,6 +168,37 @@ class DockerConfig(BaseModel):
                 raise ValueError(f'mounts[{i}]: invalid mode {parts[2]!r} in {entry!r} — must be "ro" or "rw"')
         return v
 
+    @field_validator("include", mode="before")
+    @classmethod
+    def validate_include(cls, v: list | None) -> list:
+        if v is None:
+            return []
+        result = []
+        for i, entry in enumerate(v):
+            if isinstance(entry, str):
+                result.append(entry)
+            elif isinstance(entry, dict):
+                try:
+                    result.append(IncludeItem.model_validate(entry))
+                except _PydanticValidationError as exc:
+                    raise ValueError(f"include[{i}]: {exc}") from exc
+            else:
+                raise ValueError(f"include[{i}]: expected a string or dict, got {type(entry).__name__!r}")
+        return result
+
+
+def parse_docker_include_entry(entry: str | IncludeItem) -> tuple[str, str]:
+    """Parse a single docker.yaml include entry into (path_str, mode).
+
+    Accepts the legacy string form or a validated IncludeItem::
+
+        "../other-repo"                          → ("../other-repo", "worktree")
+        IncludeItem(path="../ref", mode="ro")    → ("../ref", "ro")
+    """
+    if isinstance(entry, str):
+        return entry, "worktree"
+    return entry.path, entry.mode
+
 
 # ── Authentication ────────────────────────────────────────────────────────────
 
@@ -182,6 +222,80 @@ def get_or_create_proxy_token(repo: Path, name: str) -> str:
     token_file.write_text(token)
     logger.debug("Created proxy token for task %r", name)
     return token
+
+
+# ── kubectl helpers ───────────────────────────────────────────────────────────
+
+
+def _get_or_create_kubectl_token(session_dir: Path) -> str:
+    """Return the stable kubectl RBAC proxy token, creating it on first call."""
+    token_file = session_dir / "kubectl_proxy_token"
+    if token_file.exists():
+        return token_file.read_text().strip()
+    token = str(uuid.uuid4())
+    token_file.write_text(token)
+    return token
+
+
+@contextmanager
+def _maybe_api_server(
+    mutator: Callable[[dict[str, str]], dict[str, str]] | None,
+    proxy_token: str | None,
+    backend: agent.AgentBackend,
+) -> Generator[proxy.APIServer | None, None, None]:
+    """Conditionally start the API proxy and yield the server handle (or ``None``).
+
+    *mutator* is the gate: a non-``None`` mutator means the caller has a real
+    API key to inject, so a proxy is needed.  When ``None`` (e.g. sandbox shell
+    sessions which don't run an agent), no proxy is started and ``None`` is
+    yielded so call sites can use this unconditionally with a uniform pattern::
+
+        with _maybe_api_server(mutator, token, backend) as api_proxy, \\
+             _kubectl_context(config, session_dir) as kubectl_mounts:
+            _run_container(..., proxy_port=api_proxy.port if api_proxy else None)
+    """
+    if mutator is None:
+        yield None
+        return
+    with proxy.api_server(mutator, proxy_token or "", **backend.proxy_kwargs()) as server:
+        yield server
+
+
+@contextmanager
+def _kubectl_context(
+    config: DockerConfig,
+    session_dir: Path,
+) -> Generator[list[str], None, None]:
+    """Context manager that starts the kubectl proxy chain and yields extra mounts.
+
+    Yields an empty list when ``config.kubernetes`` is ``None``.  On exit
+    (normal or exceptional) the RBAC proxy and kubectl proxy subprocess are
+    stopped.
+    """
+    if config.kubernetes is None:
+        yield []
+        return
+
+    kubectl_proxy_token = _get_or_create_kubectl_token(session_dir)
+
+    # Start kubectl proxy subprocess (uses host kubeconfig).
+    kubectl_proc, kube_port = _kubectl_proxy.start_kubectl_proxy_proc(context=config.kubernetes.context)
+
+    # Start RBAC filtering proxy in front of it (TLS; returns cert_pem for kubeconfig).
+    rbac_server, rbac_port, ca_cert_pem = _kubectl_proxy.start_rbac_proxy(
+        config.kubernetes.rules, kubectl_proxy_token, kube_port
+    )
+
+    # Write a kubeconfig pointing to the RBAC proxy (HTTPS with pinned cert).
+    kubeconfig_path = session_dir / "kubeconfig"
+    kubeconfig_path.write_text(_kubectl_proxy.make_kubeconfig(rbac_port, kubectl_proxy_token, ca_cert_pem))
+    kubeconfig_path.chmod(0o600)
+
+    try:
+        yield [f"{kubeconfig_path}:{agent.CONTAINER_HOME}/.kube/config:ro"]
+    finally:
+        _kubectl_proxy.stop_rbac_proxy(rbac_server)
+        _kubectl_proxy.stop_kubectl_proxy_proc(kubectl_proc)
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -355,6 +469,23 @@ def ensure_docker_config(repo: Path, *, source: Path | None = None) -> bool:
     return True
 
 
+def ensure_docker_files_uncommitted(
+    repo: Path,
+    worktree: Path,
+    backend: agent.AgentBackend,
+) -> None:
+    """Ensure Docker files exist in *worktree* without committing.
+
+    Generates Dockerfile and docker.yaml in the repo root if they don't
+    already exist, then copies them into the worktree via the *source*
+    parameter so they remain uncommitted on the task branch.
+    """
+    ensure_dockerfile(repo, backend)
+    ensure_docker_config(repo)
+    ensure_dockerfile(worktree, backend, source=repo)
+    ensure_docker_config(worktree, source=repo)
+
+
 # ── DinD helpers ──────────────────────────────────────────────────────────────
 
 
@@ -379,6 +510,8 @@ def docker_features(config: DockerConfig) -> list[str]:
     features = []
     if config.dind:
         features.append("DinD")
+    if config.kubernetes is not None:
+        features.append("kubectl")
     return features
 
 
@@ -424,6 +557,181 @@ def _construct_docker_mounts(config: DockerConfig) -> list[str]:
     return result
 
 
+# Host directories whose contents are provided by the container image or kernel.
+# Mounting host equivalents over them would shadow critical binaries/libraries
+# or replace special filesystems (/proc, /sys, /dev). /tmp, /var, /home, /opt
+# are intentionally NOT blocked — users legitimately keep data there.
+_SYMLINK_SYSTEM_BLOCKLIST: tuple[Path, ...] = (
+    Path("/usr"),
+    Path("/bin"),
+    Path("/sbin"),
+    Path("/lib"),
+    Path("/lib64"),
+    Path("/etc"),
+    Path("/proc"),
+    Path("/sys"),
+    Path("/dev"),
+    Path("/run"),
+)
+
+# Directories we don't bother descending into — large, and unlikely to host
+# meaningful user-authored symlinks.
+_SYMLINK_SKIP_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".hatchery",
+        "node_modules",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+    }
+)
+
+
+def _construct_symlink_mounts(scan_root: Path, existing_mounts: list[str]) -> list[str]:
+    """Walk *scan_root* for symlinks; return -v flags for external targets.
+
+    For each symlink whose fully-resolved target lives outside the already-mounted
+    area (and outside the system blocklist), emit a single ``target:target:rw``
+    bind-mount so the symlink's stored host path resolves identically inside the
+    container. Deduplicates by unique resolved target.
+
+    Two link shapes do not survive the host→container path remap and are rejected
+    at launch with a clear error rather than silently dangling:
+      - absolute link whose target is inside *scan_root* (the host path doesn't
+        exist in the container; *scan_root* is mounted at a different location)
+      - relative link whose resolved target is outside *scan_root* (the relative
+        climb anchors at the remapped container path and lands elsewhere)
+
+    Limitation: chains that traverse multiple external symlink files only have
+    their final target mounted, not intermediate hops — those chains may still
+    dangle inside the container.
+    """
+    scan_root_resolved = scan_root.resolve()
+
+    existing: set[Path] = set()
+    for m in existing_mounts:
+        host = Path(m.split(":", 2)[0]).expanduser()
+        try:
+            existing.add(host.resolve())
+        except OSError:
+            continue
+
+    def _on_err(exc: OSError) -> None:
+        logger.debug("follow_symlinks: walk error: %s", exc)
+
+    seen: set[Path] = set()
+    mounts: list[str] = []
+    bad_abs_internal: list[tuple[Path, str]] = []
+    bad_rel_external: list[tuple[Path, str]] = []
+
+    for dirpath, dirnames, filenames in os.walk(scan_root, followlinks=False, onerror=_on_err):
+        dirnames[:] = [d for d in dirnames if d not in _SYMLINK_SKIP_DIRS]
+        for entry in list(dirnames) + filenames:
+            p = Path(dirpath) / entry
+            if not p.is_symlink():
+                continue
+            try:
+                link_str = os.readlink(p)
+            except OSError:
+                continue
+            try:
+                target = p.resolve(strict=True)
+            except (OSError, RuntimeError):
+                logger.debug("follow_symlinks: skipping unresolvable %s", p)
+                continue
+            is_absolute = os.path.isabs(link_str)
+            target_in_scan = target == scan_root_resolved or scan_root_resolved in target.parents
+
+            if is_absolute and target_in_scan:
+                bad_abs_internal.append((p, link_str))
+                continue
+            if not is_absolute and not target_in_scan:
+                bad_rel_external.append((p, link_str))
+                continue
+            if not is_absolute and target_in_scan:
+                # Relative link staying inside scan_root resolves correctly inside
+                # the container — no mount needed.
+                continue
+            # Absolute link, target outside scan_root: the happy path.
+            if target in seen:
+                continue
+            if any(target == hp or hp in target.parents for hp in existing):
+                continue
+            if any(target == sp or sp in target.parents for sp in _SYMLINK_SYSTEM_BLOCKLIST):
+                logger.debug("follow_symlinks: skipping system-path target %s", target)
+                continue
+            if any(target in hp.parents for hp in existing):
+                logger.debug("follow_symlinks: skipping parent-of-existing target %s", target)
+                continue
+            seen.add(target)
+            mounts.append(f"{target}:{target}:rw")
+
+    if bad_abs_internal or bad_rel_external:
+        lines = ["follow_symlinks: found symlinks that won't resolve inside the container:"]
+        if bad_abs_internal:
+            lines.append("")
+            lines.append(
+                f"  Absolute links pointing inside {scan_root} "
+                "(the container mounts this directory at a different absolute "
+                "path; rewrite each as a relative link):"
+            )
+            for p, link in bad_abs_internal:
+                lines.append(f"    {p} -> {link}")
+        if bad_rel_external:
+            lines.append("")
+            lines.append(
+                f"  Relative links escaping {scan_root} "
+                "(the relative climb resolves to a different path inside the "
+                "container; rewrite each as an absolute link):"
+            )
+            for p, link in bad_rel_external:
+                lines.append(f"    {p} -> {link}")
+        lines.append("")
+        lines.append("Fix the offending links, or set follow_symlinks: false in .hatchery/docker.yaml.")
+        ui.error("\n".join(lines))
+        sys.exit(1)
+
+    return mounts
+
+
+def _git_worktree_mounts(repo: Path, name: str, container_root: str) -> list[str]:
+    """Return the layered -v flags for one repo + worktree pair (pre-worktree portion).
+
+    Produces the read-only repo root + targeted read-write .git sub-mounts that
+    protect the main branch while allowing the hatchery/<name> worktree's git
+    metadata to be modified.  The worktree directory itself and any git-pointer
+    shadow file are NOT included — callers append those afterwards (so sentinel
+    files can be inserted between the .git layers and the worktree mount if needed).
+
+    This function is intentionally repo-agnostic: pass ``tasks.CONTAINER_REPO_ROOT``
+    for the primary repo or ``/includes/<basename>`` for an included secondary repo.
+    """
+    git_dir = repo / ".git"
+    mounts = [
+        f"{repo}:{container_root}:ro",  # repo root ro; .git overridden below
+        f"{git_dir}:{container_root}/.git:rw",  # unlock .git/ root for lock files
+        f"{git_dir / 'objects'}:{container_root}/.git/objects:rw",
+    ]
+    # Mount the entire hatchery/ ref directory rw so git can create .lock sidecar
+    # files alongside the branch ref during commits.
+    hatchery_refs = git_dir / "refs" / "heads" / "hatchery"
+    if hatchery_refs.exists():
+        mounts.append(f"{hatchery_refs}:{container_root}/.git/refs/heads/hatchery:rw")
+    logs_dir = git_dir / "logs"
+    if logs_dir.exists():
+        mounts.append(f"{logs_dir}:{container_root}/.git/logs:rw")
+    # Only this task's worktree git metadata is writable; other worktrees' metadata
+    # is protected by the ro parent mount (prevents `git worktree prune` damage).
+    worktree_meta = git_dir / "worktrees" / name
+    if worktree_meta.exists():
+        mounts.append(f"{worktree_meta}:{container_root}/.git/worktrees/{name}:rw")
+    return mounts
+
+
 def docker_mounts(
     repo: Path,
     worktree: Path,
@@ -439,12 +747,12 @@ def docker_mounts(
       /repo                                       ← full repo + .git, read-only
       /repo/.git                                  ← read-write (allows lock files at .git/ root)
       /repo/.git/objects                          ← read-write (new commit objects)
-      /repo/.git/refs/heads/hatchery/                  ← read-write (own branch + lock sidecar files)
+      /repo/.git/refs/heads/hatchery/             ← read-write (own branch + lock sidecar files)
       /repo/.git/logs                             ← read-write (reflogs, if dir exists)
       /repo/.git/worktrees/<n>                    ← read-write (this task's index + HEAD only)
       /repo/.git/COMMIT_EDITMSG                   ← read-write (per-task sentinel file)
       /repo/.git/ORIG_HEAD                        ← read-write (per-task sentinel file)
-      /repo/.hatchery/worktrees/<n>                ← read-write (the ONLY place edits land)
+      /repo/.hatchery/worktrees/<n>               ← read-write (the ONLY place edits land)
       /repo/.hatchery/worktrees/<n>/.git          ← container-path-aware .git pointer (file)
       {CONTAINER_HOME}/...  ← agent-specific home mounts (see backend.home_mounts())
 
@@ -463,31 +771,10 @@ def docker_mounts(
         staging temp dir + post-exit copy-back, which means commits made inside the
         container are not visible via `git log` on the host until the session ends.
     """
-    git_dir = repo / ".git"
     worktree_rel = worktree.relative_to(repo)
     container_worktree = f"{tasks.CONTAINER_REPO_ROOT}/{worktree_rel}"
-    mounts = [
-        f"{repo}:{tasks.CONTAINER_REPO_ROOT}:ro",  # .git ro via parent; overridden below
-        f"{git_dir}:{tasks.CONTAINER_REPO_ROOT}/.git:rw",  # unlock .git/ root for lock files
-        f"{git_dir / 'objects'}:{tasks.CONTAINER_REPO_ROOT}/.git/objects:rw",
-    ]
 
-    # Mount the entire task/ ref directory rw so git can create .lock sidecar
-    # files alongside the branch ref during commits.  refs/heads/ itself is
-    # read-only via the parent repo mount, so main/develop/etc. stay protected.
-    hatchery_refs_dir = git_dir / "refs" / "heads" / "hatchery"
-    if hatchery_refs_dir.exists():
-        mounts.append(f"{hatchery_refs_dir}:{tasks.CONTAINER_REPO_ROOT}/.git/refs/heads/hatchery:rw")
-
-    logs_dir = git_dir / "logs"
-    if logs_dir.exists():
-        mounts.append(f"{logs_dir}:{tasks.CONTAINER_REPO_ROOT}/.git/logs:rw")
-
-    # Only this task's worktree git metadata is writable; other worktrees' metadata
-    # is protected by the ro parent mount (prevents `git worktree prune` damage).
-    worktree_meta = git_dir / "worktrees" / name
-    if worktree_meta.exists():
-        mounts.append(f"{worktree_meta}:{tasks.CONTAINER_REPO_ROOT}/.git/worktrees/{name}:rw")
+    mounts = _git_worktree_mounts(repo, name, tasks.CONTAINER_REPO_ROOT)
 
     # git writes these into .git/ root during normal commits; use per-task sentinel
     # files so .git/ root stays ro.
@@ -505,6 +792,8 @@ def docker_mounts(
     mounts.extend(_default_home_mounts())
     mounts.extend(backend.home_mounts(session_dir))
     mounts.extend(_construct_docker_mounts(config))
+    if config.follow_symlinks:
+        mounts.extend(_construct_symlink_mounts(worktree, mounts))
     return mounts
 
 
@@ -520,12 +809,79 @@ def docker_mounts_no_worktree(
       /workspace        ← cwd, read-write
       {CONTAINER_HOME}/... ← agent-specific home mounts (see backend.home_mounts())
     """
-    return (
+    mounts = (
         [f"{cwd}:/workspace:rw"]
         + _default_home_mounts()
         + backend.home_mounts(session_dir)
         + _construct_docker_mounts(config)
     )
+    if config.follow_symlinks:
+        mounts.extend(_construct_symlink_mounts(cwd, mounts))
+    return mounts
+
+
+_unique_basename = tasks._unique_basename
+
+
+def _docker_mounts_includes(
+    include_entries: list[IncludeEntry],
+    name: str,
+    session_dir: Path,
+    no_worktree: bool,
+) -> list[str]:
+    """Return -v flags for paths included via --include / --include-rw / --include-ro.
+
+    Each path is mounted at /includes/<basename>/.  If two included paths share
+    a basename the second gets a numeric suffix (e.g. api-1).
+
+    mode="worktree": For git repos with a hatchery/<name> worktree the same
+    layered mount strategy as the primary repo is applied (root:ro, targeted
+    .git sub-dirs:rw, worktree:rw) and a corrected .git pointer file is
+    written to *session_dir* and bind-mounted over the worktree's .git file.
+
+    mode="rw" or mode="ro": Simple bind-mount with the corresponding access
+    mode.  No worktree is expected or created.
+
+    In no-worktree mode all entries fall back to a simple mount using their
+    access mode (worktree entries are treated as rw).
+    """
+    mounts: list[str] = []
+    used_basenames: set[str] = set()
+
+    for entry in include_entries:
+        path = entry.path
+        basename = _unique_basename(path.name, used_basenames)
+        used_basenames.add(basename)
+        container_path = f"{tasks.CONTAINER_INCLUDES_ROOT}/{basename}"
+
+        if entry.mode == "worktree" and not no_worktree:
+            is_git = (path / ".git").exists()
+            if is_git:
+                worktree = path / tasks.WORKTREES_SUBDIR / name
+                if worktree.exists():
+                    # Layered mounts: root ro + targeted .git rw (same as primary repo)
+                    mounts.extend(_git_worktree_mounts(path, name, container_path))
+                    container_worktree = f"{container_path}/.hatchery/worktrees/{name}"
+                    mounts.append(f"{worktree}:{container_worktree}:rw")
+                    # Rewrite .git pointer to use container-relative path
+                    git_ptr_file = session_dir / f"git_ptr_include_{basename}"
+                    git_ptr_file.write_text(f"gitdir: {container_path}/.git/worktrees/{name}\n")
+                    mounts.append(f"{git_ptr_file}:{container_worktree}/.git:rw")
+                    continue
+                logger.warning(
+                    "include worktree not found for %s (expected %s); "
+                    "falling back to plain rw mount — branch isolation unavailable.",
+                    path,
+                    worktree,
+                )
+            # Git repo without worktree, or plain dir in worktree mode → rw
+            mounts.append(f"{path}:{container_path}:rw")
+        else:
+            # reference mode (ro/rw), or no_worktree fallback
+            access = entry.mode if entry.is_reference() else "rw"
+            mounts.append(f"{path}:{container_path}:{access}")
+
+    return mounts
 
 
 def _default_home_mounts() -> list[str]:
@@ -663,6 +1019,8 @@ def _run_container(
     _interactive: bool = False,
     cap_add: list[str] | None = None,
     container_name: str | None = None,
+    proxy_port: int | None = None,
+    add_host_gateway: bool = False,
 ) -> subprocess.CompletedProcess[str] | None:
     """Assemble and execute the container run command for the given agent session.
 
@@ -673,16 +1031,14 @@ def _run_container(
     *proxy_token* is a stable per-task UUID used as the API key env var inside
     the container.  It must be provided whenever *mutator* is set.
     The same token is reused on resume.
-    """
-    # Start the host-side proxy so the real credentials never enter the container.
-    proxy_server = None
-    proxy_port = None
-    if mutator is not None:
-        proxy_server, _ = proxy.start_proxy(mutator, proxy_token, **backend.proxy_kwargs())
-        proxy_port = proxy_server.server_address[1]
-        if proxy_token is not None:
-            logger.debug("Proxy started for task; API key in container is a proxy token")
 
+    *proxy_port* is the port of the host-side API proxy, managed externally via
+    ``_maybe_api_server``.  When ``None`` no API proxy env vars are injected.
+
+    *add_host_gateway* forces the ``--add-host=host.docker.internal:host-gateway``
+    flag on Linux even when the API proxy is not active (e.g. when the kubectl
+    feature is enabled and the container needs to reach the RBAC proxy).
+    """
     cmd = [runtime.binary, "run", "--rm"]
     if _command_override is None or _interactive:
         cmd += ["-it"]
@@ -696,10 +1052,12 @@ def _run_container(
     if mutator is not None and proxy_port is not None:
         for key, val in backend.container_env(proxy_token, proxy_port).items():
             cmd += ["-e", f"{key}={val}"]
-        # On Linux, Docker doesn't automatically expose host.docker.internal;
-        # --add-host maps it to the host gateway so the container can reach the proxy.
-        if sys.platform == "linux":
-            cmd += ["--add-host=host.docker.internal:host-gateway"]
+
+    # On Linux, Docker doesn't automatically expose host.docker.internal;
+    # --add-host maps it to the host gateway so the container can reach any
+    # host-side proxy (API proxy and/or kubectl RBAC proxy).
+    if (proxy_port is not None or add_host_gateway) and sys.platform == "linux":
+        cmd += ["--add-host=host.docker.internal:host-gateway"]
 
     cmd += ["-e", f"HATCHERY_TASK={name}"]
     cmd += ["-e", f"HATCHERY_REPO={hatchery_repo}"]
@@ -748,24 +1106,16 @@ def _run_container(
     if _command_override is not None:
         cmd += _command_override
         logger.debug(f"Launching {runtime.binary} container image={image!r} name={name!r} (command override)")
-        try:
-            if _interactive:
-                subprocess.run(cmd)
-                return None
-            return subprocess.run(cmd, capture_output=True, text=True)
-        finally:
-            if proxy_server is not None:
-                proxy.stop_proxy(proxy_server)
+        if _interactive:
+            subprocess.run(cmd)
+            return None
+        return subprocess.run(cmd, capture_output=True, text=True)
 
     # Append the full agent command (binary + args, docker-mode already applied).
     cmd += agent_cmd
 
     logger.debug(f"Launching {runtime.binary} container image={image!r} name={name!r} workdir={workdir!r}")
-    try:
-        result = subprocess.run(cmd)
-    finally:
-        if proxy_server is not None:
-            proxy.stop_proxy(proxy_server)
+    result = subprocess.run(cmd)
     if result.returncode != 0:
         ui.warn(f"{runtime.binary} container exited with code {result.returncode}")
         if runtime == Runtime.PODMAN and result.returncode == 137:
@@ -787,6 +1137,7 @@ def launch_docker(
     config: DockerConfig,
     runtime: Runtime = Runtime.DOCKER,
     no_cache: bool = False,
+    include_repos: list[IncludeEntry] | None = None,
 ) -> None:
     """Replace the current process with a Docker-sandboxed agent session.
 
@@ -794,6 +1145,10 @@ def launch_docker(
     Auth is provided via the appropriate API key env var or per-task config.
     *agent_cmd* must be the full command already built for Docker mode
     (``backend.build_*_command(docker=True, workdir=container_workdir)``).
+
+    *include_repos* — additional paths to mount at /includes/<basename>/.
+    Git repos with mode="worktree" and a hatchery/<name> worktree also have
+    their .git pointer corrected for the container environment.
     """
     try:
         mutator = backend.make_header_mutator()
@@ -833,22 +1188,32 @@ def launch_docker(
     build_docker_image(repo, worktree, name, backend, runtime=runtime, no_cache=no_cache)
     image = docker_image_name(repo, name)
     mounts = docker_mounts(repo, worktree, name, backend, session_dir, config, git_sentinels, worktree_git_ptr=git_ptr)
+    if include_repos:
+        mounts.extend(_docker_mounts_includes(include_repos, name, session_dir, no_worktree=False))
+
     logger.debug(f"Launching {runtime.binary} container for task '{name}'")
-    return _run_container(
-        image,
-        mounts,
-        container_worktree,
-        tasks.CONTAINER_REPO_ROOT,
-        name,
-        mutator,
-        proxy_token,
-        agent_cmd,
-        backend=backend,
-        dind=config.dind,
-        runtime=runtime,
-        cap_add=config.cap_add,
-        container_name=task_container_name(repo, name),
-    )
+    with (
+        _maybe_api_server(mutator, proxy_token, backend) as api_proxy,
+        _kubectl_context(config, session_dir) as kubectl_mounts,
+    ):
+        mounts.extend(kubectl_mounts)
+        _run_container(
+            image,
+            mounts,
+            container_worktree,
+            tasks.CONTAINER_REPO_ROOT,
+            name,
+            mutator,
+            proxy_token,
+            agent_cmd,
+            backend=backend,
+            dind=config.dind,
+            runtime=runtime,
+            cap_add=config.cap_add,
+            container_name=task_container_name(repo, name),
+            proxy_port=api_proxy.port if api_proxy else None,
+            add_host_gateway=bool(kubectl_mounts),
+        )
 
 
 def launch_docker_no_worktree(
@@ -859,6 +1224,7 @@ def launch_docker_no_worktree(
     config: DockerConfig,
     runtime: Runtime = Runtime.DOCKER,
     no_cache: bool = False,
+    include_repos: list[IncludeEntry] | None = None,
 ) -> None:
     """Launch a Docker-sandboxed agent session with cwd mounted as /workspace.
 
@@ -866,6 +1232,8 @@ def launch_docker_no_worktree(
     Builds the image from cwd/.hatchery/Dockerfile (same as standard mode).
     *agent_cmd* must be the full command already built for Docker mode
     (``backend.build_*_command(docker=True, workdir="/workspace")``).
+
+    *include_repos* — additional paths to mount at /includes/<basename>/.
     """
     try:
         mutator = backend.make_header_mutator()
@@ -885,22 +1253,32 @@ def launch_docker_no_worktree(
     build_docker_image(cwd, cwd, name, backend, runtime=runtime, no_cache=no_cache)
     image = docker_image_name(cwd, name)
     mounts = docker_mounts_no_worktree(cwd, backend, session_dir, config=config)
+    if include_repos:
+        mounts.extend(_docker_mounts_includes(include_repos, name, session_dir, no_worktree=True))
+
     logger.debug(f"Launching {runtime.binary} container for task '{name}' (no-worktree mode)")
-    return _run_container(
-        image,
-        mounts,
-        "/workspace",
-        "/workspace",
-        name,
-        mutator,
-        proxy_token,
-        agent_cmd,
-        backend=backend,
-        dind=config.dind,
-        runtime=runtime,
-        cap_add=config.cap_add,
-        container_name=task_container_name(cwd, name),
-    )
+    with (
+        _maybe_api_server(mutator, proxy_token, backend) as api_proxy,
+        _kubectl_context(config, session_dir) as kubectl_mounts,
+    ):
+        mounts.extend(kubectl_mounts)
+        _run_container(
+            image,
+            mounts,
+            "/workspace",
+            "/workspace",
+            name,
+            mutator,
+            proxy_token,
+            agent_cmd,
+            backend=backend,
+            dind=config.dind,
+            runtime=runtime,
+            cap_add=config.cap_add,
+            container_name=task_container_name(cwd, name),
+            proxy_port=api_proxy.port if api_proxy else None,
+            add_host_gateway=bool(kubectl_mounts),
+        )
 
 
 def launch_sandbox_shell(
@@ -918,24 +1296,37 @@ def launch_sandbox_shell(
     """
     build_docker_image(repo, repo, "sandbox", backend, runtime=runtime, no_cache=no_cache)
     image = docker_image_name(repo, "sandbox")
-    mounts = (
-        [f"{repo}:{tasks.CONTAINER_REPO_ROOT}:rw"]
-        + _default_home_mounts()
-        + _construct_docker_mounts(config)
-    )
-    _run_container(
-        image=image,
-        mounts=mounts,
-        workdir=tasks.CONTAINER_REPO_ROOT,
-        hatchery_repo=tasks.CONTAINER_REPO_ROOT,
-        name="sandbox",
-        mutator=None,
-        proxy_token=None,
-        agent_cmd=[],
-        runtime=runtime,
-        _command_override=[shell],
-        _interactive=True,
-    )
+    mounts = [f"{repo}:{tasks.CONTAINER_REPO_ROOT}:rw"] + _default_home_mounts() + _construct_docker_mounts(config)
+
+    # Use a short-lived session dir under ~/.hatchery/ for the kubeconfig mount.
+    # tempfile.TemporaryDirectory() is not reliable on macOS because Python
+    # resolves to /var/folders/… which is outside Podman Machine's default
+    # virtio-fs share roots (only /Users/ and /private/tmp are shared).
+    sandbox_session_dir = tasks.HATCHERY_DIR / "sandbox-sessions" / str(uuid.uuid4())
+    sandbox_session_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with (
+            _maybe_api_server(None, None, backend) as api_proxy,
+            _kubectl_context(config, sandbox_session_dir) as kubectl_mounts,
+        ):
+            mounts = list(mounts) + kubectl_mounts
+            _run_container(
+                image=image,
+                mounts=mounts,
+                workdir=tasks.CONTAINER_REPO_ROOT,
+                hatchery_repo=tasks.CONTAINER_REPO_ROOT,
+                name="sandbox",
+                mutator=None,
+                proxy_token=None,
+                agent_cmd=[],
+                runtime=runtime,
+                _command_override=[shell],
+                _interactive=True,
+                proxy_port=api_proxy.port if api_proxy else None,
+                add_host_gateway=bool(kubectl_mounts),
+            )
+    finally:
+        shutil.rmtree(sandbox_session_dir, ignore_errors=True)
 
 
 def exec_task_shell(name: str, runtime: Runtime, repo: Path, shell: str = "/bin/bash") -> None:
