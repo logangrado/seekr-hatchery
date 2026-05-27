@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
-import seekr_hatchery.tasks as tasks
+from seekr_hatchery import utils
 from seekr_hatchery.locks import hatchery_lock
 
 from .agent_backend import CONTAINER_HOME, AgentBackend
@@ -112,7 +112,7 @@ class ClaudeBackend(AgentBackend):
         logger.debug("Checking macOS Keychain for Claude Code token")
 
         logger.debug("Checking for API key login")
-        result = tasks.run(
+        result = utils.run(
             ["security", "find-generic-password", "-s", "Claude Code", "-w"],
             check=False,
             sensitive=True,
@@ -124,7 +124,7 @@ class ClaudeBackend(AgentBackend):
                 return token, "API_KEY"
 
         logger.debug("Checking for OAuth login")
-        result = tasks.run(
+        result = utils.run(
             ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
             check=False,
             sensitive=True,
