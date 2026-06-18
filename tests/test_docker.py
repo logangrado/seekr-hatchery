@@ -628,7 +628,7 @@ class TestDockerMountsIncludes:
         return IncludeEntry(path=path, mode=mode)
 
     def test_plain_dir_gets_rw_mount(self, tmp_path):
-        """A plain (non-git) directory in worktree mode is mounted rw."""
+        """A plain (non-git) directory in worktree mode is mounted rw at its host path."""
         plain = tmp_path / "shared-data"
         plain.mkdir()
         session_dir = tmp_path / "session"
@@ -636,7 +636,7 @@ class TestDockerMountsIncludes:
 
         mounts = docker._docker_mounts_includes([self._entry(plain)], "my-task", session_dir, no_worktree=False)
 
-        assert mount.Mount(src=str(plain), dst="/includes/shared-data", mode="rw") in mounts
+        assert mount.BindMount(src=str(plain), dst=str(plain), mode="RW") in mounts
 
     def test_git_repo_without_worktree_gets_rw_mount(self, tmp_path):
         """A git repo in worktree mode with no worktree for the task falls back to rw mount."""
@@ -648,11 +648,11 @@ class TestDockerMountsIncludes:
 
         mounts = docker._docker_mounts_includes([self._entry(repo)], "my-task", session_dir, no_worktree=False)
 
-        assert mount.Mount(src=str(repo), dst="/includes/repo-b", mode="rw") in mounts
+        assert mount.BindMount(src=str(repo), dst=str(repo), mode="RW") in mounts
         assert not any("git_ptr" in str(m.src or "") for m in mounts)
 
     def test_git_repo_with_worktree_gets_layered_mounts(self, tmp_path):
-        """A git repo in worktree mode with a task worktree gets layered mounts."""
+        """A git repo in worktree mode with a task worktree gets layered mounts at host paths."""
 
         repo = tmp_path / "repo-b"
         repo.mkdir()
@@ -666,32 +666,14 @@ class TestDockerMountsIncludes:
 
         mounts = docker._docker_mounts_includes([self._entry(repo)], "my-task", session_dir, no_worktree=False)
 
-        assert mount.Mount(src=str(repo), dst="/includes/repo-b", mode="ro") in mounts
-        assert mount.Mount(src=str(git_dir), dst="/includes/repo-b/.git", mode="rw") in mounts
-        assert mount.Mount(src=str(git_dir / "objects"), dst="/includes/repo-b/.git/objects", mode="rw") in mounts
-        container_wt = "/includes/repo-b/.hatchery/worktrees/my-task"
-        assert mount.Mount(src=str(worktree), dst=container_wt, mode="rw") in mounts
-        git_ptr_file = session_dir / "git_ptr_include_repo-b"
-        assert git_ptr_file.exists()
-        assert "gitdir: /includes/repo-b/.git/worktrees/my-task" in git_ptr_file.read_text()
-        assert mount.Mount(src=str(git_ptr_file), dst=f"{container_wt}/.git", mode="rw") in mounts
-        assert mount.Mount(src=str(repo), dst="/includes/repo-b", mode="rw") not in mounts
-
-    def test_basename_collision_gets_numeric_suffix(self, tmp_path):
-        """Two paths sharing the same basename get distinct container paths."""
-        a = tmp_path / "a" / "api"
-        b = tmp_path / "b" / "api"
-        a.mkdir(parents=True)
-        b.mkdir(parents=True)
-        session_dir = tmp_path / "session"
-        session_dir.mkdir()
-
-        mounts = docker._docker_mounts_includes(
-            [self._entry(a), self._entry(b)], "task", session_dir, no_worktree=False
-        )
-
-        assert mount.Mount(src=str(a), dst="/includes/api", mode="rw") in mounts
-        assert mount.Mount(src=str(b), dst="/includes/api-1", mode="rw") in mounts
+        assert mount.BindMount(src=str(repo), dst=str(repo), mode="RO") in mounts
+        assert mount.BindMount(src=str(git_dir), dst=f"{repo}/.git", mode="RW") in mounts
+        assert mount.BindMount(src=str(git_dir / "objects"), dst=f"{repo}/.git/objects", mode="RW") in mounts
+        assert mount.BindMount(src=str(worktree), dst=str(worktree), mode="RW") in mounts
+        # No .git pointer rewrite — under host-path mirroring, the worktree's
+        # existing .git file already resolves correctly inside the container.
+        assert not any("git_ptr" in str(m.src or "") for m in mounts)
+        assert mount.BindMount(src=str(repo), dst=str(repo), mode="RW") not in mounts
 
     def test_no_worktree_skips_layered_mounts(self, tmp_path):
         """In no-worktree mode, worktree-mode git repos get a simple rw mount."""
@@ -706,10 +688,8 @@ class TestDockerMountsIncludes:
 
         mounts = docker._docker_mounts_includes([self._entry(repo)], "my-task", session_dir, no_worktree=True)
 
-        assert mount.Mount(src=str(repo), dst="/includes/repo-b", mode="rw") in mounts
-        git_ptr_file = session_dir / "git_ptr_include_repo-b"
-        assert not git_ptr_file.exists()
-        assert not any(str(git_ptr_file) == str(m.src) for m in mounts)
+        assert mount.BindMount(src=str(repo), dst=str(repo), mode="RW") in mounts
+        assert not any("git_ptr" in str(m.src or "") for m in mounts)
 
     def test_empty_list_returns_empty(self, tmp_path):
         mounts = docker._docker_mounts_includes([], "task", tmp_path, no_worktree=False)
@@ -728,7 +708,7 @@ class TestDockerMountsIncludes:
             [self._entry(plain, mode="rw")], "my-task", session_dir, no_worktree=False
         )
 
-        assert mount.Mount(src=str(plain), dst="/includes/shared-data", mode="rw") in mounts
+        assert mount.BindMount(src=str(plain), dst=str(plain), mode="RW") in mounts
 
     def test_reference_ro_plain_dir(self, tmp_path):
         """mode='ro' gives a simple ro mount."""
@@ -741,8 +721,8 @@ class TestDockerMountsIncludes:
             [self._entry(plain, mode="ro")], "my-task", session_dir, no_worktree=False
         )
 
-        assert mount.Mount(src=str(plain), dst="/includes/docs", mode="ro") in mounts
-        assert mount.Mount(src=str(plain), dst="/includes/docs", mode="rw") not in mounts
+        assert mount.BindMount(src=str(plain), dst=str(plain), mode="RO") in mounts
+        assert mount.BindMount(src=str(plain), dst=str(plain), mode="RW") not in mounts
 
     def test_reference_mode_git_repo_no_layered_mounts(self, tmp_path):
         """mode='ro' on a git repo with a worktree still just does a simple ro mount."""
@@ -762,9 +742,9 @@ class TestDockerMountsIncludes:
             [self._entry(repo, mode="ro")], "my-task", session_dir, no_worktree=False
         )
 
-        assert mount.Mount(src=str(repo), dst="/includes/repo-b", mode="ro") in mounts
+        assert mount.BindMount(src=str(repo), dst=str(repo), mode="RO") in mounts
         # No layered mounts
-        assert mount.Mount(src=str(repo), dst="/includes/repo-b", mode="rw") not in mounts
+        assert mount.BindMount(src=str(repo), dst=str(repo), mode="RW") not in mounts
         assert not any("git_ptr" in str(m.src or "") for m in mounts)
         assert not any("worktrees" in str(m.dst or "") for m in mounts)
 
@@ -783,7 +763,7 @@ class TestDockerMountsIncludes:
             [self._entry(repo, mode="rw")], "my-task", session_dir, no_worktree=False
         )
 
-        assert mount.Mount(src=str(repo), dst="/includes/repo-c", mode="rw") in mounts
+        assert mount.BindMount(src=str(repo), dst=str(repo), mode="RW") in mounts
         assert not any("git_ptr" in str(m.src or "") for m in mounts)
         assert not any("worktrees" in str(m.dst or "") for m in mounts)
 
@@ -807,9 +787,9 @@ class TestDockerMountsIncludes:
         mounts = docker._docker_mounts_includes(entries, "my-task", session_dir, no_worktree=False)
 
         # worktree entry without an actual worktree → rw fallback
-        assert mount.Mount(src=str(wt_repo), dst="/includes/wt-repo", mode="rw") in mounts
+        assert mount.BindMount(src=str(wt_repo), dst=str(wt_repo), mode="RW") in mounts
         # ro reference entry
-        assert mount.Mount(src=str(ro_dir), dst="/includes/docs", mode="ro") in mounts
+        assert mount.BindMount(src=str(ro_dir), dst=str(ro_dir), mode="RO") in mounts
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +842,153 @@ class TestDockerConfigInclude:
 
         with pytest.raises(ValidationError):
             docker.DockerConfig(unknown_field="oops")
+
+
+# ---------------------------------------------------------------------------
+# DockerConfig.volumes field
+# ---------------------------------------------------------------------------
+
+
+class TestDockerConfigVolumes:
+    def test_parses_volume_entry(self):
+        config = docker.DockerConfig(volumes=[{"name": "uv-cache", "path": "/home/hatchery/.cache/uv"}])
+        assert config.volumes == [docker.CacheVolume(name="uv-cache", path="/home/hatchery/.cache/uv")]
+
+    def test_name_with_colon_is_invalid(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            docker.DockerConfig(volumes=[{"name": "bad:name", "path": "/cache"}])
+
+    def test_name_with_slash_is_invalid(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            docker.DockerConfig(volumes=[{"name": "bad/name", "path": "/cache"}])
+
+    def test_relative_path_is_invalid(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            docker.DockerConfig(volumes=[{"name": "uv-cache", "path": "relative/cache"}])
+
+    def test_none_coerced_to_empty(self):
+        # `volumes:` in YAML with all-commented entries parses to None;
+        # match the `mounts:` behavior and treat that as an empty list.
+        assert docker.DockerConfig(volumes=None).volumes == []
+
+
+class TestConstructVolumeMounts:
+    def test_empty(self):
+        assert docker._construct_volume_mounts(docker.DockerConfig()) == []
+
+    def test_prefixes_name_and_emits_volume_mount(self):
+        cfg = docker.DockerConfig(
+            volumes=[
+                {"name": "uv-cache", "path": "/home/hatchery/.cache/uv"},
+                {"name": "pip-cache", "path": "/home/hatchery/.cache/pip"},
+            ]
+        )
+        assert docker._construct_volume_mounts(cfg) == [
+            mount.VolumeMount(name="hatchery-uv-cache", dst="/home/hatchery/.cache/uv", mode="RW", task_scoped=False),
+            mount.VolumeMount(name="hatchery-pip-cache", dst="/home/hatchery/.cache/pip", mode="RW", task_scoped=False),
+        ]
+
+
+class TestEnsureVolumes:
+    def _record_run(self, returncodes_by_cmd):
+        """Build a fake `run` that records calls and returns rc per arg-tuple key.
+
+        *returncodes_by_cmd* maps a tuple like ("volume", "inspect", "name") to
+        the returncode that `run` should report.  Unknown calls default to 0.
+        """
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+            key = tuple(cmd[1:])  # strip runtime binary
+            rc = returncodes_by_cmd.get(key, 0)
+            result = MagicMock()
+            result.returncode = rc
+            return result
+
+        return calls, fake_run
+
+    def test_skips_non_volume_mounts(self, monkeypatch):
+        calls, fake_run = self._record_run({})
+        monkeypatch.setattr(docker, "run", fake_run)
+
+        mounts = [mount.BindMount(src="/host/x", dst="/cont/x", mode="RW")]
+        docker._ensure_volumes(docker.Runtime.DOCKER, mounts)
+
+        assert calls == []
+
+    def test_creates_when_inspect_fails(self, monkeypatch):
+        calls, fake_run = self._record_run({("volume", "inspect", "hatchery-uv"): 1})
+        monkeypatch.setattr(docker, "run", fake_run)
+
+        mounts = [mount.VolumeMount(name="hatchery-uv", dst="/cache", mode="RW", task_scoped=False)]
+        docker._ensure_volumes(docker.Runtime.DOCKER, mounts)
+
+        assert calls == [
+            ["docker", "volume", "inspect", "hatchery-uv"],
+            ["docker", "volume", "create", "hatchery-uv"],
+        ]
+
+    def test_skips_create_when_inspect_succeeds(self, monkeypatch):
+        calls, fake_run = self._record_run({("volume", "inspect", "hatchery-uv"): 0})
+        monkeypatch.setattr(docker, "run", fake_run)
+
+        mounts = [mount.VolumeMount(name="hatchery-uv", dst="/cache", mode="RW", task_scoped=False)]
+        docker._ensure_volumes(docker.Runtime.PODMAN, mounts)
+
+        assert calls == [["podman", "volume", "inspect", "hatchery-uv"]]
+
+    def test_dedupes_repeated_names(self, monkeypatch):
+        calls, fake_run = self._record_run({("volume", "inspect", "hatchery-uv"): 0})
+        monkeypatch.setattr(docker, "run", fake_run)
+
+        mounts = [
+            mount.VolumeMount(name="hatchery-uv", dst="/cache/a", mode="RW", task_scoped=False),
+            mount.VolumeMount(name="hatchery-uv", dst="/cache/b", mode="RW", task_scoped=False),
+        ]
+        docker._ensure_volumes(docker.Runtime.DOCKER, mounts)
+
+        assert calls == [["docker", "volume", "inspect", "hatchery-uv"]]
+
+
+class TestDefaultHomeMounts:
+    def test_default_home_mounts(self, tmp_path, monkeypatch):
+        # Canary: assert the exact set of default home mounts so any
+        # accidental change to the defaults shows up loudly in tests.
+        home = tmp_path / "home"
+        (home / ".cache" / "uv").mkdir(parents=True)
+        (home / ".gitconfig").write_text("[user]\n")
+        monkeypatch.setattr(docker.Path, "home", lambda: home)
+
+        assert docker._default_home_mounts() == [
+            mount.BindMount(src=str(home / ".gitconfig"), dst=f"{agent.CONTAINER_HOME}/.gitconfig", mode="RO"),
+        ]
+
+
+class TestBuildMountsIncludesVolumes:
+    def _make_backend(self):
+        b = MagicMock()
+        b.construct_mounts = MagicMock(return_value=[])
+        return b
+
+    def test_no_worktree_appends_volume_mount(self, tmp_path, monkeypatch):
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        monkeypatch.setattr(docker, "_default_home_mounts", lambda: [])
+
+        cfg = docker.DockerConfig(volumes=[{"name": "uv-cache", "path": "/home/hatchery/.cache/uv"}])
+        mounts = docker.build_mounts(_no_wt_meta(cwd), self._make_backend(), tmp_path, cfg)
+
+        expected = mount.VolumeMount(
+            name="hatchery-uv-cache", dst="/home/hatchery/.cache/uv", mode="RW", task_scoped=False
+        )
+        assert expected in mounts
 
 
 # ensure_docker_files_uncommitted
@@ -1017,7 +1144,7 @@ class TestConstructSymlinkMounts:
         mounts = docker._construct_symlink_mounts(scan, [])
 
         target = external.resolve()
-        assert mounts == [mount.Mount(src=str(target), dst=str(target), mode="rw")]
+        assert mounts == [mount.BindMount(src=str(target), dst=str(target), mode="RW")]
 
     def test_external_dir_symlink_emits_mount(self, tmp_path):
         scan = self._scan_root(tmp_path)
@@ -1029,7 +1156,7 @@ class TestConstructSymlinkMounts:
         mounts = docker._construct_symlink_mounts(scan, [])
 
         target = external.resolve()
-        assert mount.Mount(src=str(target), dst=str(target), mode="rw") in mounts
+        assert mount.BindMount(src=str(target), dst=str(target), mode="RW") in mounts
 
     def test_relative_internal_symlink_skipped(self, tmp_path):
         """Relative links staying inside scan_root resolve correctly in the
@@ -1063,7 +1190,7 @@ class TestConstructSymlinkMounts:
         (scan / "link").symlink_to(external_file)
 
         # external_root is already a mount; its child should be skipped
-        existing = [mount.Mount(src=str(external_root), dst="/mounted/external", mode="ro")]
+        existing = [mount.BindMount(src=str(external_root), dst="/mounted/external", mode="RO")]
         mounts = docker._construct_symlink_mounts(scan, existing)
 
         assert mounts == []
@@ -1123,67 +1250,34 @@ class TestConstructSymlinkMounts:
         mounts = docker._construct_symlink_mounts(scan, [])
 
         target = external.resolve()
-        assert mounts == [mount.Mount(src=str(target), dst=str(target), mode="rw")]
+        assert mounts == [mount.BindMount(src=str(target), dst=str(target), mode="RW")]
 
-    def test_absolute_internal_link_raises(self, tmp_path, capsys):
-        """Absolute link pointing inside scan_root fails loudly — the host path
-        doesn't exist inside the container after the worktree remap."""
+    def test_absolute_internal_link_skipped(self, tmp_path):
+        """Absolute link pointing inside scan_root needs no extra mount: under
+        host-path mirroring, the scan_root mount makes the absolute host path
+        resolve identically inside the container."""
         scan = self._scan_root(tmp_path)
         (scan / "inner.txt").write_text("x")
         (scan / "link").symlink_to(scan / "inner.txt")  # absolute target
 
-        with pytest.raises(SystemExit):
-            docker._construct_symlink_mounts(scan, [])
+        mounts = docker._construct_symlink_mounts(scan, [])
 
-        err = capsys.readouterr().err
-        assert "follow_symlinks" in err
-        assert "Absolute links pointing inside" in err
-        assert str(scan / "link") in err
+        assert mounts == []
 
-    def test_relative_external_link_raises(self, tmp_path, capsys):
-        """Relative link escaping scan_root fails loudly — the relative climb
-        anchors at the remapped container path and lands elsewhere."""
+    def test_relative_external_link_emits_mount(self, tmp_path):
+        """Relative link escaping scan_root needs its target mounted at the
+        host path — under host-path mirroring the relative climb lands at the
+        same absolute path on both sides, so a target:target bind-mount
+        suffices."""
         scan = self._scan_root(tmp_path)
         external = tmp_path / "external"
         external.mkdir()
         (scan / "link").symlink_to("../external")
 
-        with pytest.raises(SystemExit):
-            docker._construct_symlink_mounts(scan, [])
+        mounts = docker._construct_symlink_mounts(scan, [])
 
-        err = capsys.readouterr().err
-        assert "Relative links escaping" in err
-        assert str(scan / "link") in err
-        assert "../external" in err
-
-    def test_error_reports_both_kinds_at_once(self, tmp_path, capsys):
-        """Multiple problematic links are reported together, not one at a time."""
-        scan = self._scan_root(tmp_path)
-        (scan / "inner.txt").write_text("x")
-        (tmp_path / "external").mkdir()
-        (scan / "abs_bad").symlink_to(scan / "inner.txt")
-        (scan / "rel_bad").symlink_to("../external")
-
-        with pytest.raises(SystemExit):
-            docker._construct_symlink_mounts(scan, [])
-
-        err = capsys.readouterr().err
-        assert "Absolute links pointing inside" in err
-        assert "Relative links escaping" in err
-        assert str(scan / "abs_bad") in err
-        assert str(scan / "rel_bad") in err
-
-    def test_error_mentions_disabling_the_flag(self, tmp_path, capsys):
-        """Error message points the user at the escape hatch."""
-        scan = self._scan_root(tmp_path)
-        (scan / "inner.txt").write_text("x")
-        (scan / "link").symlink_to(scan / "inner.txt")
-
-        with pytest.raises(SystemExit):
-            docker._construct_symlink_mounts(scan, [])
-
-        err = capsys.readouterr().err
-        assert "follow_symlinks: false" in err
+        target = external.resolve()
+        assert mounts == [mount.BindMount(src=str(target), dst=str(target), mode="RW")]
 
 
 # ---------------------------------------------------------------------------
@@ -1210,7 +1304,7 @@ class TestNoWorktreeFollowSymlinks:
         mounts = docker.build_mounts(_no_wt_meta(cwd), self._make_backend(), tmp_path, cfg)
 
         target = external.resolve()
-        assert mount.Mount(src=str(target), dst=str(target), mode="rw") not in mounts
+        assert mount.BindMount(src=str(target), dst=str(target), mode="RW") not in mounts
 
     def test_enabled_adds_symlink_mounts(self, tmp_path, monkeypatch):
         cwd = tmp_path / "cwd"
@@ -1224,7 +1318,7 @@ class TestNoWorktreeFollowSymlinks:
         mounts = docker.build_mounts(_no_wt_meta(cwd), self._make_backend(), tmp_path, cfg)
 
         target = external.resolve()
-        assert mount.Mount(src=str(target), dst=str(target), mode="rw") in mounts
+        assert mount.BindMount(src=str(target), dst=str(target), mode="RW") in mounts
 
 
 # ---------------------------------------------------------------------------
@@ -1257,7 +1351,7 @@ class TestClipboardImageMount:
         mounts = docker.build_mounts(_no_wt_meta(cwd), self._make_backend(), session_dir, cfg)
 
         clip = session_dir / "clipboard"
-        assert mount.Mount(src=str(clip), dst=str(clip), mode="rw") in mounts
+        assert mount.BindMount(src=str(clip), dst=str(clip), mode="RW") in mounts
         # And the directory was actually created on the host.
         assert clip.is_dir()
 
