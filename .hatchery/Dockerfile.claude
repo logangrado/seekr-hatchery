@@ -12,7 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make \
     unzip \
     zip \
-    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Non-root user ─────────────────────────────────────────────────────────────
@@ -22,21 +21,15 @@ ENV HOME=/home/hatchery
 ENV PATH="/home/hatchery/.npm-global/bin:/home/hatchery/.local/bin:$PATH"
 
 # ── Agent install ─────────────────────────────────────────────────────────────
-# ── OpenAI Codex CLI ──────────────────────────────────────────────────────────
-USER root
-RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
-    && rm -rf /var/lib/apt/lists/*
-USER hatchery
-RUN npm config set prefix '/home/hatchery/.npm-global' \
-    && npm install -g @openai/codex@0.142.4
+# ── Claude Code ───────────────────────────────────────────────────────────────
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # =============================================================================
 # Optional extras — uncomment what you need
 # =============================================================================
 
 # ── Python / uv ───────────────────────────────────────────────────────────────
-# COPY --from=ghcr.io/astral-sh/uv:0.10.7 /uv /uvx /bin/
-# ENV UV_PROJECT_ENVIRONMENT=/home/hatchery/.venv
+COPY --from=ghcr.io/astral-sh/uv:0.10.7 /uv /uvx /bin/
 
 # ── Go ────────────────────────────────────────────────────────────────────────
 # COPY --from=golang:1.24 /usr/local/go /usr/local/go
@@ -76,3 +69,7 @@ RUN printf '#!/bin/sh\nexec sudo -n /usr/bin/podman "$@"\n' \
         > /usr/local/bin/podman \
     && chmod +x /usr/local/bin/podman
 USER hatchery
+
+# =============================================================================
+
+WORKDIR /repo
