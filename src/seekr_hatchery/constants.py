@@ -7,11 +7,12 @@ referenced only from inside its home module should stay there (and be
 prefixed ``_`` to mark it private).
 """
 
+import os
 from pathlib import Path
 
 # Per-user state lives under ~/.hatchery. Cross-module: docker writes the
 # sandbox session dir under HATCHERY_DIR.
-HATCHERY_DIR = Path.home() / ".hatchery"
+HATCHERY_DIR = Path(os.environ.get("HATCHERY_HOME", Path.home() / ".hatchery"))
 
 # Default branch/commit new tasks fork from when the user doesn't pass --from.
 # Read by cli.py to populate the click option default and help text.
