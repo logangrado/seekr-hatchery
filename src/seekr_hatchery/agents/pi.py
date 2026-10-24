@@ -289,6 +289,21 @@ class PiBackend(AgentBackend):
     # covers both flows deterministically, unlike --continue/--resume (no id)
     # or --session (accepts partial-UUID fuzzy matching, not exact-id-only).
     @staticmethod
+    def _system_prompt_args(system_prompt: str, *, docker: bool) -> list[str]:
+        """Explicitly include the global append prompt with Hatchery's prompt.
+
+        Passing ``--append-system-prompt`` prevents Pi from discovering
+        ``APPEND_SYSTEM.md`` itself, so it must be supplied as another
+        repeatable flag.
+        """
+        args = ["--append-system-prompt", system_prompt]
+        host_append = Path.home() / ".pi" / "agent" / "APPEND_SYSTEM.md"
+        if host_append.exists():
+            append_path = f"{CONTAINER_HOME}/.pi/agent/APPEND_SYSTEM.md" if docker else str(host_append)
+            args.extend(["--append-system-prompt", append_path])
+        return args
+
+    @staticmethod
     def build_new_command(
         session_id: str,
         system_prompt: str,
@@ -297,7 +312,12 @@ class PiBackend(AgentBackend):
         docker: bool = False,
         workdir: str = "",
     ) -> list[str]:
-        args = ["--session-id", session_id, "--append-system-prompt", system_prompt, initial_prompt]
+        args = [
+            "--session-id",
+            session_id,
+            *PiBackend._system_prompt_args(system_prompt, docker=docker),
+            initial_prompt,
+        ]
         if docker:
             return ["sh", "-c", PiBackend._DOCKER_WRAPPER, "sh", *args]
         return ["pi", *args]
@@ -311,7 +331,7 @@ class PiBackend(AgentBackend):
         docker: bool = False,
         workdir: str = "",
     ) -> list[str]:
-        args = ["--session-id", session_id, "--append-system-prompt", system_prompt]
+        args = ["--session-id", session_id, *PiBackend._system_prompt_args(system_prompt, docker=docker)]
         if docker:
             return ["sh", "-c", PiBackend._DOCKER_WRAPPER, "sh", *args]
         return ["pi", *args]
@@ -326,7 +346,13 @@ class PiBackend(AgentBackend):
         workdir: str = "",
     ) -> list[str]:
         # --print / -p: "Non-interactive mode: process prompt and exit" (pi --help).
-        args = ["--print", "--session-id", session_id, "--append-system-prompt", system_prompt, wrap_up_prompt]
+        args = [
+            "--print",
+            "--session-id",
+            session_id,
+            *PiBackend._system_prompt_args(system_prompt, docker=docker),
+            wrap_up_prompt,
+        ]
         if docker:
             return ["sh", "-c", PiBackend._DOCKER_WRAPPER, "sh", *args]
         return ["pi", *args]
@@ -347,11 +373,13 @@ class PiBackend(AgentBackend):
         into the container.
 
         Host paths layered on top of the volume. Optional files and npm modules
-        are ``.exists()``-guarded. ``extensions/`` and ``skills/`` are created
-        before mounting so sandbox-authored global resources persist on the
-        host:
+        are ``.exists()``-guarded. ``agents/``, ``extensions/`` and ``skills/``
+        are created before mounting so sandbox-authored global resources
+        persist on the host:
 
         - ``settings.json`` RW — user config, flows both ways.
+        - ``AGENTS.md`` and ``APPEND_SYSTEM.md`` RW — global instructions stay
+          consistent between native and sandboxed sessions.
         - ``models-store.json`` RO — pi's model catalogue; RO keeps upstream
           target resolution host-authoritative.
         - ``hatchery-host-models.json`` RO — a per-launch sanitized copy of the
@@ -362,19 +390,20 @@ class PiBackend(AgentBackend):
           itself, so it takes the host's; RO stops per-task installs from
           polluting the host tree. Pure-JS + same arch, so portable (unlike
           ``bin/``, which holds native binaries).
-        - ``extensions/`` and ``skills/`` RW — global extensions and skills are
-          auto-discovered here and session-authored changes persist on the
-          host. Symlink targets are also mounted so dotfiles-managed resources
-          load.
+        - ``agents/``, ``extensions/`` and ``skills/`` RW — custom subagents,
+          global extensions and global skills are available here, and
+          session-authored changes persist on the host. Symlink targets are
+          also mounted so dotfiles-managed resources load.
 
         ``bin/`` and ``sessions/`` stay container-local in the volume.
         """
         agent_dir = Path.home() / ".pi" / "agent"
         agent_dst = f"{CONTAINER_HOME}/.pi/agent"
         mounts: list[Mount] = [VolumeMount(name="pi-dir", dst=agent_dst)]
-        settings = agent_dir / "settings.json"
-        if settings.exists():
-            mounts.append(BindMount(src=settings, dst=f"{agent_dst}/settings.json", mode="RW"))
+        for name in ("settings.json", "AGENTS.md", "APPEND_SYSTEM.md"):
+            config_file = agent_dir / name
+            if config_file.exists():
+                mounts.append(BindMount(src=config_file, dst=f"{agent_dst}/{name}", mode="RW"))
         store = agent_dir / "models-store.json"
         if store.exists():
             mounts.append(BindMount(src=store, dst=f"{agent_dst}/models-store.json", mode="RO"))
@@ -384,7 +413,7 @@ class PiBackend(AgentBackend):
         node_modules = agent_dir / "npm" / "node_modules"
         if node_modules.exists():
             mounts.append(BindMount(src=node_modules, dst=f"{agent_dst}/npm/node_modules", mode="RO"))
-        for name in ("extensions", "skills"):
+        for name in ("agents", "extensions", "skills"):
             resource_dir = agent_dir / name
             resource_dir.mkdir(parents=True, exist_ok=True)
             mounts.append(BindMount(src=resource_dir, dst=f"{agent_dst}/{name}", follow_links=True))

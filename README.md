@@ -282,13 +282,14 @@ directories](#symlinked-directories).
 ### The container's `~/.pi/agent`
 
 Pi sandbox sessions keep their own agent state in a per-task volume. Hatchery
-bind-mounts your host `settings.json`, `models-store.json`, installed npm
-modules, and global `extensions/` and `skills/` directories. Hatchery creates
-the two directories on the host if needed, then mounts them read-write:
-extensions and skills are auto-discovered normally, session-authored changes
-persist on the host, and host edits can be hot-reloaded with `/reload`.
-Symlink targets within both directories are mounted too, so dotfiles-managed
-resources and their dependencies load correctly.
+bind-mounts your host `settings.json`, `AGENTS.md`, `APPEND_SYSTEM.md`,
+`models-store.json`, installed npm modules, and global `agents/`, `extensions/`,
+and `skills/` directories. Hatchery creates the three directories on the host
+if needed, then mounts them read-write: custom subagents, extensions, and skills
+are discovered normally, session-authored changes persist on the host, and host
+edits can be hot-reloaded with `/reload`. Symlink targets within all three
+directories are mounted too, so dotfiles-managed resources and their
+dependencies load correctly.
 
 Host `models.json` custom providers, model definitions, and overrides are also
 available in the sandbox. Before every launch, Hatchery creates a sanitized

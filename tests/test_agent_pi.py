@@ -111,6 +111,43 @@ class TestBuildNewCommand:
         ]
 
 
+class TestBuildAppendSystemPrompt:
+    def test_native(self, home):
+        append = home / ".pi" / "agent" / "APPEND_SYSTEM.md"
+        append.parent.mkdir(parents=True)
+        append.write_text("global instructions")
+
+        assert agent.PI.build_new_command("sid", "sys", "initial") == [
+            "pi",
+            "--session-id",
+            "sid",
+            "--append-system-prompt",
+            "sys",
+            "--append-system-prompt",
+            str(append),
+            "initial",
+        ]
+
+    def test_docker(self, home):
+        append = home / ".pi" / "agent" / "APPEND_SYSTEM.md"
+        append.parent.mkdir(parents=True)
+        append.write_text("global instructions")
+
+        assert agent.PI.build_new_command("sid", "sys", "initial", docker=True) == [
+            "sh",
+            "-c",
+            pi_backend.PiBackend._DOCKER_WRAPPER,
+            "sh",
+            "--session-id",
+            "sid",
+            "--append-system-prompt",
+            "sys",
+            "--append-system-prompt",
+            f"{agent.CONTAINER_HOME}/.pi/agent/APPEND_SYSTEM.md",
+            "initial",
+        ]
+
+
 class TestBuildResumeCommand:
     def test_native(self):
         cmd = agent.PI.build_resume_command("sid", "sys")
@@ -484,14 +521,21 @@ class TestConstructMounts:
     def test_creates_and_mounts_global_resources_when_no_host_config(self, home, tmp_path):
         # autouse ``home`` fixture points Path.home() at an empty temp dir,
         # so neither settings.json nor models-store.json exists.
-        vol, ext, skills = agent.PI.construct_mounts(tmp_path)
+        vol, agents, ext, skills = agent.PI.construct_mounts(tmp_path)
 
         assert [
             (vol.name, vol.dst, vol.mode, vol.seed),
+            (agents.src, agents.dst, agents.mode, agents.follow_links),
             (ext.src, ext.dst, ext.mode, ext.follow_links),
             (skills.src, skills.dst, skills.mode, skills.follow_links),
         ] == [
             ("pi-dir", f"{agent.CONTAINER_HOME}/.pi/agent", "RW", None),
+            (
+                home / ".pi" / "agent" / "agents",
+                f"{agent.CONTAINER_HOME}/.pi/agent/agents",
+                "RW",
+                True,
+            ),
             (
                 home / ".pi" / "agent" / "extensions",
                 f"{agent.CONTAINER_HOME}/.pi/agent/extensions",
@@ -505,36 +549,43 @@ class TestConstructMounts:
                 True,
             ),
         ]
+        assert agents.src.is_dir()
         assert ext.src.is_dir()
         assert skills.src.is_dir()
 
     def test_layers_host_config_binds_over_volume(self, home, tmp_path):
         agent_dir = home / ".pi" / "agent"
         agent_dir.mkdir(parents=True)
-        (agent_dir / "settings.json").write_text("{}")
+        settings = agent_dir / "settings.json"
+        settings.write_text("{}")
+        agents_md = agent_dir / "AGENTS.md"
+        agents_md.write_text("global context")
+        append_system = agent_dir / "APPEND_SYSTEM.md"
+        append_system.write_text("global system instructions")
         (agent_dir / "models-store.json").write_text("{}")
         node_modules = agent_dir / "npm" / "node_modules"
         node_modules.mkdir(parents=True)
+        agents_dir = agent_dir / "agents"
+        agents_dir.mkdir()
         extensions = agent_dir / "extensions"
         extensions.mkdir()
         skills = agent_dir / "skills"
         skills.mkdir()
 
-        vol, settings, store, nm, ext, skill_mount = agent.PI.construct_mounts(tmp_path)
+        mounts = agent.PI.construct_mounts(tmp_path)
 
-        assert isinstance(vol, mount.VolumeMount)
+        assert isinstance(mounts[0], mount.VolumeMount)
         assert [
-            (vol.dst, vol.mode),
-            (settings.src, settings.dst, settings.mode),
-            (store.src, store.dst, store.mode),
-            (nm.src, nm.dst, nm.mode),
-            (ext.src, ext.dst, ext.mode, ext.follow_links),
-            (skill_mount.src, skill_mount.dst, skill_mount.mode, skill_mount.follow_links),
+            (item.src, item.dst, item.mode, item.follow_links)
+            for item in mounts[1:]
+            if isinstance(item, mount.BindMount)
         ] == [
-            (f"{agent.CONTAINER_HOME}/.pi/agent", "RW"),
-            (agent_dir / "settings.json", f"{agent.CONTAINER_HOME}/.pi/agent/settings.json", "RW"),
-            (agent_dir / "models-store.json", f"{agent.CONTAINER_HOME}/.pi/agent/models-store.json", "RO"),
-            (node_modules, f"{agent.CONTAINER_HOME}/.pi/agent/npm/node_modules", "RO"),
+            (settings, f"{agent.CONTAINER_HOME}/.pi/agent/settings.json", "RW", False),
+            (agents_md, f"{agent.CONTAINER_HOME}/.pi/agent/AGENTS.md", "RW", False),
+            (append_system, f"{agent.CONTAINER_HOME}/.pi/agent/APPEND_SYSTEM.md", "RW", False),
+            (agent_dir / "models-store.json", f"{agent.CONTAINER_HOME}/.pi/agent/models-store.json", "RO", False),
+            (node_modules, f"{agent.CONTAINER_HOME}/.pi/agent/npm/node_modules", "RO", False),
+            (agents_dir, f"{agent.CONTAINER_HOME}/.pi/agent/agents", "RW", True),
             (extensions, f"{agent.CONTAINER_HOME}/.pi/agent/extensions", "RW", True),
             (skills, f"{agent.CONTAINER_HOME}/.pi/agent/skills", "RW", True),
         ]
