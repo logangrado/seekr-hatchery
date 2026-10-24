@@ -282,10 +282,10 @@ directories](#symlinked-directories).
 ### The container's `~/.pi/agent`
 
 Pi sandbox sessions keep their own agent state in a per-task volume. Hatchery
-bind-mounts your host `settings.json`, `AGENTS.md`, `APPEND_SYSTEM.md`,
-`models-store.json`, installed npm modules, and global `agents/`, `extensions/`,
-and `skills/` directories. Hatchery creates the three directories on the host
-if needed, then mounts them read-write: custom subagents, extensions, and skills
+bind-mounts your host `settings.json`, `AGENTS.md`, `APPEND_SYSTEM.md`, model
+catalog, installed npm modules, and global `agents/`, `extensions/`, and
+`skills/` directories. Hatchery creates the three directories on the host if
+needed, then mounts them read-write: custom subagents, extensions, and skills
 are discovered normally, session-authored changes persist on the host, and host
 edits can be hot-reloaded with `/reload`. Symlink targets within all three
 directories are mounted too, so dotfiles-managed resources and their
@@ -293,12 +293,15 @@ dependencies load correctly.
 
 Host `models.json` custom providers, model definitions, and overrides are also
 available in the sandbox. Before every launch, Hatchery creates a sanitized
-per-task copy and mounts it read-only. Pi's container wrapper merges that copy
-with the generated proxy configuration, replacing upstream URLs and API keys
-with per-session proxy values. Host changes therefore take effect on the next
-launch or resume without exposing the host model API keys to the container.
-Authentication remains container-local and contains only the per-session proxy
-credentials.
+per-task copy and mounts the host model catalog under an internal read-only
+filename. Pi's container wrapper writes the catalog into the task volume with
+each configured model's upstream origin replaced by the session proxy while
+retaining that model's base path. It applies the same routing to custom provider
+and model URLs. Providers whose effective model URLs use multiple origins
+cannot run sandboxed; configure their provider and model URLs to share one
+origin first. Host changes therefore take effect on the next launch or resume
+without exposing host model API keys to the container. Authentication remains
+container-local and contains only the per-session proxy credentials.
 
 ### Container runtime auto-detection
 
