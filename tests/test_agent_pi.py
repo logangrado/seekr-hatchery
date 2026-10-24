@@ -791,6 +791,73 @@ class TestLifecycleHooksAreNoops:
 
 
 class TestDockerWrapperSecurity:
+    @pytest.mark.parametrize("existing_mode", [None, 0o600, 0o444], ids=["new", "resume", "read-only-resume"])
+    def test_replaces_catalog_on_launch_without_changing_session_state(
+        self, tmp_path: Path, existing_mode: int | None
+    ) -> None:
+        if existing_mode == 0o444 and os.geteuid() == 0:
+            pytest.skip("Root bypasses file permissions")
+        agent_dir = tmp_path / ".pi" / "agent"
+        agent_dir.mkdir(parents=True)
+        catalog = agent_dir / "models-store.json"
+        if existing_mode is not None:
+            catalog.write_text('{"old": true}')
+            catalog.chmod(existing_mode)
+        source = agent_dir / pi_backend._HOST_MODELS_STORE_FILENAME
+        source.write_text(
+            '{"openrouter":{"models":[{"id":"coder","api":"openai-completions",'
+            '"baseUrl":"https://openrouter.ai/api/v1"}]}}'
+        )
+        session = agent_dir / "sessions" / "existing.jsonl"
+        session.parent.mkdir()
+        session.write_text("existing session\n")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        pi_shim = bin_dir / "pi"
+        pi_shim.write_text("#!/bin/sh\nexit 0\n")
+        pi_shim.chmod(0o755)
+        env = {
+            "HOME": str(tmp_path),
+            "PATH": _path_with_pi_shim(bin_dir),
+            "HATCHERY_PI_OPENROUTER_ID": "openrouter",
+            "HATCHERY_PI_OPENROUTER_PROXY_ORIGIN": "http://host.docker.internal:12345",
+            "HATCHERY_PI_OPENROUTER_KEY": "proxy-token",
+            "HATCHERY_PI_OPENROUTER_SHAPE": "api_key",
+        }
+
+        result = subprocess.run(
+            ["sh", "-c", pi_backend.PiBackend._DOCKER_WRAPPER, "sh"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        assert (result.returncode, result.stderr) == (0, "")
+        assert json.loads(catalog.read_text()) == {
+            "openrouter": {
+                "models": [
+                    {
+                        "id": "coder",
+                        "api": "openai-completions",
+                        "baseUrl": "http://host.docker.internal:12345/api/v1",
+                    }
+                ]
+            }
+        }
+        assert session.read_text() == "existing session\n"
+        assert json.loads(source.read_text()) == {
+            "openrouter": {
+                "models": [{"id": "coder", "api": "openai-completions", "baseUrl": "https://openrouter.ai/api/v1"}]
+            }
+        }
+        assert sorted(item.name for item in agent_dir.iterdir()) == [
+            "auth.json",
+            pi_backend._HOST_MODELS_STORE_FILENAME,
+            "models-store.json",
+            "models.json",
+            "sessions",
+        ]
+
     @pytest.mark.parametrize("caller_offline", [None, "0"])
     def test_exports_offline_mode_to_pi_and_its_children(self, tmp_path: Path, caller_offline: str | None) -> None:
         fake_home = tmp_path / "fakehome"

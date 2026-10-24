@@ -101,7 +101,17 @@ for (const name of Object.keys(process.env).filter((key) => /^HATCHERY_PI_[A-Z0-
     : { type: "api_key", key };
 }
 
-if (hasHostStore) fs.writeFileSync(path.join(agentDir, "models-store.json"), JSON.stringify(store));
+if (hasHostStore) {
+  // Old read-only bind mounts can leave a non-writable file in the task volume.
+  const temporaryDir = fs.mkdtempSync(path.join(agentDir, ".models-store-"));
+  try {
+    const temporaryStore = path.join(temporaryDir, "models-store.json");
+    fs.writeFileSync(temporaryStore, JSON.stringify(store));
+    fs.renameSync(temporaryStore, path.join(agentDir, "models-store.json"));
+  } finally {
+    fs.rmSync(temporaryDir, { recursive: true, force: true });
+  }
+}
 fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify(models));
 fs.writeFileSync(path.join(agentDir, "auth.json"), JSON.stringify(auth));
 HATCHERY_NODE
